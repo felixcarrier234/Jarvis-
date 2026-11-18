@@ -8,12 +8,17 @@ LANCEUR="$HOME/jarvis-demarrage.sh"
 LOG="$HOME/.openjarvis/jarvis-voix.log"
 # Trouver le dossier « Démarrage » de Windows (depuis C:\ pour éviter les soucis de chemin UNC).
 cd /mnt/c 2>/dev/null || true
-STARTUP_WIN="$(powershell.exe -NoProfile -Command '[Environment]::GetFolderPath("Startup")' 2>/dev/null | tr -d '\r' | tail -n1 || true)"
+STARTUP_WIN="$(powershell.exe -NoProfile -Command '[Console]::OutputEncoding=[Text.Encoding]::UTF8; [Environment]::GetFolderPath("Startup")' 2>/dev/null | tr -d '\r' | tail -n1 || true)"
 if [[ ! "$STARTUP_WIN" =~ ^[A-Za-z]:\\ ]]; then
   APPDATA_WIN="$(cmd.exe /c 'echo %APPDATA%' 2>/dev/null | tr -d '\r' | tail -n1 || true)"
   [[ "$APPDATA_WIN" =~ ^[A-Za-z]:\\ ]] && STARTUP_WIN="$APPDATA_WIN\\Microsoft\\Windows\\Start Menu\\Programs\\Startup"
 fi
 STARTUP="$(wslpath -u "$STARTUP_WIN" 2>/dev/null || true)"
+if [[ -n "$STARTUP" && ! -d "$(dirname "$STARTUP")" ]]; then
+  # Accents abîmés (ex. « F�lix ») : on remplace chaque caractère spécial par « * » et on cherche.
+  MOTIF="$(dirname "$STARTUP" | LC_ALL=C sed 's/[^!-~]\+/*/g')"
+  for d in $MOTIF; do [[ -d "$d" ]] && STARTUP="$d/Startup" && break; done
+fi
 cd "$HOME"
 if [[ -z "$STARTUP" || ! -d "$(dirname "$STARTUP")" ]]; then
   echo "❌ Impossible de trouver le dossier Démarrage de Windows."
