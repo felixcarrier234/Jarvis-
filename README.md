@@ -54,6 +54,9 @@ Il lit tes courriels, connaît ton agenda, te rappelle tes rendez-vous et te fai
 5. Démarrage automatique avec Windows : `./demarrage-auto.sh` (retirer : `./demarrage-auto.sh retirer`).
 
 ### Utilisation
+- **Répondre aux courriels** : « Réponds à Amélie que je serai là samedi », ou « Réponds à Amélie » (il résume et demande quoi répondre), ou « Écris un courriel à nom@exemple.com pour dire que … ». Il lit le brouillon et n'envoie qu'après « oui » (boutons ✅/❌ sur Telegram). Envoi par Gmail (même mot de passe d'application).
+- **Contrôler le PC** : « Ouvre Spotify / YouTube / la calculatrice », « Mets Céline Dion sur YouTube », « Mets de la musique », « Pause », « Chanson suivante », « Monte le son », « Volume à 30 », « Verrouille l'ordi », « Éteins l'ordi » (à confirmer, « annule l'arrêt »), « Mets un minuteur de 10 minutes ».
+- **Trajets** (OpenStreetMap, sans trafic) : « Combien de temps pour aller au Costco de Laval ? » ; avant un rendez-vous avec un lieu, « il est temps de partir ». Adresse de départ dans les réglages.
 - **Interface « HUD »** (http://localhost:8765) : dites **« Hey Jarvis »** (prononcé à l'anglaise), cliquez sur le réacteur ou appuyez sur Espace. Il répond phrase par phrase sur les haut-parleurs, réécoute 6 s pour la suite, et « Hey Jarvis » le coupe quand il parle. Nécessite `openwakeword==0.4.0`.
 - **Reconnaissance vocale sur la carte NVIDIA** : `~/.jarvis-voix/bin/python ~/jarvis_voix.py accelerer`.
 - **Mémoire** : « Souviens-toi que … », « Oublie ce que je t'ai dit sur … », « Qu'est-ce que tu sais sur moi ? » (`/memoire`). Les anniversaires dictés (« l'anniversaire de Julie est le 21 novembre ») sont rappelés le jour même.

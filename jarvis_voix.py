@@ -42,7 +42,7 @@ import tomllib
 from collections import defaultdict, deque
 from datetime import date, datetime, timedelta
 from email.header import decode_header, make_header
-from email.utils import parsedate_to_datetime
+from email.utils import parseaddr, parsedate_to_datetime
 from pathlib import Path
 
 import httpx
@@ -333,6 +333,22 @@ def reglages() -> None:
                       s.get("equipe", "MTL")).upper()
     s["annoncer_pubs"] = ask("10) Annoncer aussi les courriels publicitaires ? (o/n)",
                              "o" if s.get("annoncer_pubs") else "n").lower().startswith("o")
+    adresse = ask("11) TRAJETS — ton adresse de départ (ex. 123 rue Principale, Laval ; vide = pas de trajets)",
+                  s.get("adresse", ""))
+    if adresse and (adresse != s.get("adresse") or "dom_lat" not in s):
+        try:
+            g = geocoder(adresse, {"pays": s.get("pays", "ca")})
+            if g:
+                s.update(adresse=adresse, dom_lat=g[0], dom_lon=g[1])
+                print(f"   → trouvé : {g[2][:90]}")
+            else:
+                print("   ❌ Adresse introuvable, essaie avec la ville.")
+        except Exception as exc:  # noqa: BLE001
+            print(f"   ❌ Adresse introuvable ({exc}).")
+    elif not adresse:
+        for k in ("adresse", "dom_lat", "dom_lon"):
+            s.pop(k, None)
+    s["prenom"] = ask("12) COURRIELS — ton prénom pour signer les réponses (vide = sans signature)", s.get("prenom", ""))
 
     save_settings(s)
     print(f"\nRéglages enregistrés dans {SETTINGS}\n\nTest des connexions…")
@@ -449,6 +465,9 @@ def fetch_emails(s: dict, limit: int = 8, since_uid: int = 0) -> list[dict]:
                 "unread": "\\Seen" not in flags,
                 "body": body,
                 "categorie": classer_courriel(msg, subject, body),
+                "addr": parseaddr(str(msg.get("Reply-To") or msg.get("From") or ""))[1],
+                "message_id": str(msg.get("Message-ID") or ""),
+                "references": str(msg.get("References") or ""),
             })
         return out
     finally:
@@ -1060,6 +1079,350 @@ MOTS_STOP = re.compile(r"^\s*(?:jarvis\W+)?(stop|arr[eê]te|tais[- ]toi|chut|sil
 
 
 # ---------------------------------------------------------------------------
+# Répondre aux courriels (toujours avec confirmation)
+# ---------------------------------------------------------------------------
+
+REPONDRE = re.compile(r"^\s*(?:jarvis\W+)?(?:r[ée]ponds?|r[ée]pondre|r[ée]ponds-lui)\s+(?:au courriel\s+|au message\s+)?"
+                      r"(?:de\s+|d['’]|à\s+|a\s+)?(?P<qui>[\w'’ .-]+?)\s*(?:que\b|qu['’]|pour dire que|pour lui dire que|en disant que|"
+                      r"pour lui dire|pour dire|:|,)\s*(?P<consigne>.+)$", re.I)
+ECRIRE = re.compile(r"^\s*(?:jarvis\W+)?(?:[ée]cris|envoie|écrire|envoyer)\s+(?:un\s+)?(?:courriel|e-?mail|mail|message)\s+"
+                    r"(?:à|a)\s+(?P<qui>[\w'’ .@-]+?)\s*(?:pour (?:lui )?dire que|pour (?:lui )?dire|que\b|qu['’]|:|,)\s*(?P<consigne>.+)$", re.I)
+OUI = re.compile(r"^\s*(?:oui|ouais|ok|okay|d.accord|vas-y|go|envoie(?:-le)?|parfait|c.est (?:bon|parfait)|exactement|"
+                 r"envoie le courriel)\b", re.I)
+NON = re.compile(r"^\s*(?:non|annule|laisse faire|laisse tomber|oublie ça|n.envoie pas|pas maintenant)\b", re.I)
+MODIFIE = re.compile(r"^\s*(?:change|modifie|ajoute|enl[eè]ve|remplace|plutôt|plutot|mais|écris plutôt|rajoute|dis plutôt|"
+                     r"mets plutôt|reformule)\b", re.I)
+
+REPONDRE_SEUL = re.compile(r"^\s*(?:jarvis\W+)?(?:r[ée]ponds?|r[ée]pondre)(?:-lui|\s+lui)?(?:\s+(?:au courriel\s+|au message\s+)?"
+                           r"(?:de\s+|d['’]|à\s+|a\s+)?(?P<qui>[\w'’ .-]+?))?\s*[.!?]*$", re.I)
+
+_brouillon: dict = {}
+_attente: dict = {}       # « Que voulez-vous lui répondre ? » en attente
+_dernier_courriel: dict = {}  # le dernier courriel annoncé (pour « réponds-lui »)
+
+
+def _smtp_host(s: dict) -> str:
+    h = s.get("imap_host", "")
+    return s.get("smtp_host") or ("smtp.gmail.com" if "gmail" in h else "smtp-mail.outlook.com" if "outlook" in h
+                                  else h.replace("imap", "smtp", 1))
+
+
+def envoyer_courriel(s: dict, a: str, sujet: str, corps: str, in_reply_to: str = "", references: str = "") -> None:
+    import smtplib
+    from email.message import EmailMessage
+    from email.utils import formataddr, make_msgid
+
+    msg = EmailMessage()
+    msg["From"] = formataddr((s.get("prenom") or "", s["email"]))
+    msg["To"] = a
+    msg["Subject"] = sujet
+    msg["Message-ID"] = make_msgid()
+    if in_reply_to:
+        msg["In-Reply-To"] = in_reply_to
+        msg["References"] = (references + " " + in_reply_to).strip()
+    msg.set_content(corps)
+    with smtplib.SMTP(_smtp_host(s), 587, timeout=30) as smtp:
+        smtp.starttls()
+        smtp.login(s["email"], s["email_password"])
+        smtp.send_message(msg)
+
+
+def _trouver_courriel(s: dict, qui: str) -> dict | None:
+    """Le courriel le plus récent dont l'expéditeur ressemble à « qui »."""
+    cle = _sans_accents(qui).strip()
+    for m in fetch_emails(s, 40):
+        if cle and (cle in _sans_accents(m["from"]) or cle in _sans_accents(m.get("addr", ""))):
+            return m
+    return None
+
+
+async def rediger(consigne: str, original: dict | None, nom: str, s: dict) -> str:
+    prenom = s.get("prenom") or ""
+    contexte = ""
+    if original:
+        contexte = (f"Voici le courriel reçu de {original['from']} (objet : {original['subject']}) :\n"
+                    f"« {original['body'][:1500]} »\n\n")
+    texte = await llm([
+        {"role": "system", "content": "Tu rédiges des courriels en français pour l'utilisateur, en son nom (à la "
+                                      "première personne). Style naturel, poli et court. Réponds UNIQUEMENT avec le "
+                                      "corps du courriel (salutation, message, formule de fin), sans objet ni commentaire."},
+        {"role": "user", "content": f"{contexte}Rédige {'la réponse' if original else 'un courriel'} à {nom}. Ce que je "
+                                    f"veux dire : {consigne}." + (f" Signe « {prenom} »." if prenom else "")},
+    ])
+    return texte.strip()
+
+
+async def creer_brouillon(m, ecrire: bool) -> str:
+    s = load_settings()
+    if not s.get("email") or not s.get("email_password"):
+        return "Le courriel n'est pas branché. Lance les réglages pour l'ajouter."
+    qui, consigne = m.group("qui").strip(" ,."), m.group("consigne").strip()
+    original = None
+    if "@" in qui:
+        a, nom = qui, qui.split("@")[0]
+    else:
+        original = await asyncio.to_thread(_trouver_courriel, s, qui)
+        if not original:
+            return (f"Je n'ai pas trouvé de courriel récent de {qui}. Donne-moi son adresse, par exemple : "
+                    f"écris un courriel à nom@exemple.com pour dire que …")
+        a, nom = original["addr"], original["from"]
+    corps = await rediger(consigne, original if not ecrire else None, nom, s)
+    sujet = (("Re: " + re.sub(r"^\s*(re|tr|fwd?)\s*:\s*", "", original["subject"], flags=re.I))
+             if original and not ecrire else (consigne[:60].capitalize() if ecrire else "Message"))
+    _brouillon.clear()
+    _brouillon.update(a=a, nom=nom, sujet=sujet, corps=corps, consigne=consigne, original=original if not ecrire else None,
+                      expire=time.time() + 600, nouveau=True)
+    return f"Voici le brouillon pour {nom} :\n\n{corps}\n\nJe l'envoie ? Dites oui, non, ou ce qu'il faut changer."
+
+
+async def demander_reponse(qui: str | None) -> str:
+    """« Réponds à Amélie » sans dire quoi : on résume son courriel et on demande quoi répondre."""
+    s = load_settings()
+    if not s.get("email") or not s.get("email_password"):
+        return "Le courriel n'est pas branché. Lance les réglages pour l'ajouter."
+    original = await asyncio.to_thread(_trouver_courriel, s, qui) if qui else (_dernier_courriel or None)
+    if not original:
+        return f"Je n'ai pas trouvé de courriel récent de {qui}." if qui else "À qui voulez-vous répondre ?"
+    resume = await llm([
+        {"role": "system", "content": "Résume en une seule phrase courte, en français, ce que demande ou dit ce "
+                                      "courriel. Commence par le prénom de l'expéditeur."},
+        {"role": "user", "content": f"De {original['from']}, objet « {original['subject']} » :\n{original['body'][:1500]}"},
+    ])
+    _attente.clear()
+    _attente.update(original=original, expire=time.time() + 300)
+    return f"{resume or 'Courriel de ' + original['from'] + ' : ' + original['subject'] + '.'} Que voulez-vous lui répondre ?"
+
+
+async def gerer_brouillon(question: str) -> str | None:
+    if _attente and time.time() < _attente.get("expire", 0) and not _brouillon:
+        o = _attente.pop("original")
+        _attente.clear()
+        if NON.match(question):
+            return "D'accord, on laisse faire."
+        s = load_settings()
+        corps = await rediger(question, o, o["from"], s)
+        _brouillon.update(a=o["addr"], nom=o["from"], sujet="Re: " + re.sub(r"^\s*(re|tr|fwd?)\s*:\s*", "", o["subject"],
+                                                                                flags=re.I),
+                          corps=corps, consigne=question, original=o, expire=time.time() + 600, nouveau=True)
+        return f"Voici le brouillon pour {o['from']} :\n\n{corps}\n\nJe l'envoie ? Dites oui, non, ou ce qu'il faut changer."
+    if not _brouillon or time.time() > _brouillon.get("expire", 0):
+        _brouillon.clear()
+        return None
+    if OUI.match(question):
+        b = dict(_brouillon)
+        _brouillon.clear()
+        o = b.get("original") or {}
+        try:
+            await asyncio.to_thread(envoyer_courriel, load_settings(), b["a"], b["sujet"], b["corps"],
+                                    o.get("message_id", ""), o.get("references", ""))
+        except Exception as exc:  # noqa: BLE001
+            return f"L'envoi a échoué : {exc}"
+        return f"C'est envoyé à {b['nom']}."
+    if NON.match(question):
+        _brouillon.clear()
+        return "D'accord, je ne l'envoie pas."
+    if MODIFIE.match(question):
+        s = load_settings()
+        _brouillon["consigne"] += f". Modification demandée : {question}"
+        _brouillon["corps"] = await rediger(_brouillon["consigne"], _brouillon.get("original"), _brouillon["nom"], s)
+        _brouillon["expire"], _brouillon["nouveau"] = time.time() + 600, True
+        return f"Nouveau brouillon :\n\n{_brouillon['corps']}\n\nJe l'envoie ?"
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Contrôler l'ordinateur (Windows) — seulement des actions d'une liste connue
+# ---------------------------------------------------------------------------
+
+APPLIS = {  # nom dit → (cible pour Start-Process, nom affiché)
+    "spotify": ("spotify:", "Spotify"), "chrome": ("chrome", "Chrome"), "google chrome": ("chrome", "Chrome"),
+    "edge": ("msedge", "Edge"), "navigateur": ("msedge", "le navigateur"), "word": ("winword", "Word"),
+    "excel": ("excel", "Excel"), "powerpoint": ("powerpnt", "PowerPoint"), "outlook": ("outlook", "Outlook"),
+    "teams": ("msteams:", "Teams"), "discord": ("discord:", "Discord"), "steam": ("steam:", "Steam"),
+    "calculatrice": ("calc", "la calculatrice"), "bloc-notes": ("notepad", "le bloc-notes"),
+    "bloc notes": ("notepad", "le bloc-notes"), "explorateur": ("explorer", "l'explorateur de fichiers"),
+    "mes fichiers": ("explorer", "l'explorateur de fichiers"), "paramètres": ("ms-settings:", "les paramètres"),
+    "parametres": ("ms-settings:", "les paramètres"), "youtube": ("https://www.youtube.com", "YouTube"),
+    "netflix": ("https://www.netflix.com", "Netflix"), "gmail": ("https://mail.google.com", "Gmail"),
+    "facebook": ("https://www.facebook.com", "Facebook"), "messenger": ("https://www.messenger.com", "Messenger"),
+    "google": ("https://www.google.com", "Google"), "agenda": ("https://calendar.google.com", "ton agenda"),
+    "calendrier": ("https://calendar.google.com", "ton agenda"), "météo": ("https://meteo.gc.ca", "la météo"),
+    "photos": ("ms-photos:", "Photos"), "xbox": ("xbox:", "Xbox"), "minecraft": ("minecraft:", "Minecraft"),
+}
+TOUCHES = {"monter": 175, "baisser": 174, "muet": 173, "suivante": 176, "precedente": 177, "lecture": 179}
+
+PC_OUVRE = re.compile(r"^\s*(?:jarvis\W+)?(?:ouvre|ouvrir|lance|lancer|démarre|demarre|va sur|mets?(?:-moi)?)\s+"
+                      r"(?:l['’]appli(?:cation)?\s+|le\s+|la\s+|les\s+|l['’]|mon\s+|ma\s+|mes\s+)?(?P<app>[\w' -]+?)\s*[.!?]*$", re.I)
+PC_RECHERCHE = re.compile(r"^\s*(?:jarvis\W+)?(?:mets|mais|joue|fais jouer|lance|cherche|recherche|ouvre)\s+(?P<q>.+?)\s+"
+                          r"(?:sur|dans)\s+(?P<ou>youtube|spotify|google)\s*[.!?]*$", re.I)
+POLI = r"^\s*(?:jarvis\W+)?(?:(?:peux-tu|pourrais-tu|tu peux|veux-tu|est-ce que tu peux)\s+)?"
+PC_VOLUME = re.compile(POLI + r"(?:(?P<sens>monte|monter|augmente|baisse|baisser|diminue|coupe|couper|remets|rétablis|retablis)\s+"
+                       r"(?:le\s+|un peu le\s+)?(?:son|volume)|(?:mets\s+(?:le\s+)?)?volume\s+(?:à|a|au)\s+(?P<pct>\d{1,3})\s*%?|"
+                       r"(?:mets\s+(?:l['’]ordi\s+)?)?(?P<muet>mode muet|en sourdine|sourdine))\s*(?:s.il te pla[iî]t)?\s*[.!?]*$", re.I)
+PC_MEDIA = re.compile(r"^\s*(?:jarvis\W+)?(?P<a>pause|mets? (?:la musique )?(?:sur|en) pause|reprends|reprend|relance la musique|"
+                      r"play|lecture|chanson suivante|suivante|prochaine chanson|passe(?: la chanson)?|chanson précédente|"
+                      r"précédente|precedente)\s*(?:la musique|la chanson)?\s*[.!?]*$", re.I)
+PC_MUSIQUE = re.compile(r"^\s*(?:jarvis\W+)?(?:mets|mais|joue|lance|fais jouer)\s+(?:de la|la|une|ma)\s+musique\s*[.!?]*$", re.I)
+PC_VERROU = re.compile(POLI + r"(?:verrouille|verrouiller|barre|bloque)\s+(?:l['’]|mon\s+|la\s+)?(?:ordi|ordinateur|pc|écran|ecran|session)\b", re.I)
+PC_ETEINDRE = re.compile(POLI + r"(?:éteins|eteins|éteindre|eteindre|ferme|arrête|arrete)\s+(?:l['’]|mon\s+)?(?:ordi|ordinateur|pc)\b", re.I)
+PC_ANNULE_ARRET = re.compile(r"\bannule\s+(?:l['’])?(?:arrêt|arret|extinction)\b|\bn.éteins pas\b|\bne t.éteins pas\b", re.I)
+MINUTEUR = re.compile(r"\b(?:minuteur|minuterie|timer|chrono)\b.*?\b(?P<n>\d+|une?|deux|trois|cinq|dix|quinze|vingt|trente)\s*"
+                      r"(?P<u>minutes?|min|heures?|h|secondes?|s)\b", re.I)
+
+_arret: dict = {}
+_trajets: dict = {}
+
+
+def powershell(script: str) -> subprocess.CompletedProcess:
+    if not shutil.which("powershell.exe"):
+        raise RuntimeError("le contrôle de l'ordinateur ne marche que sous Windows")
+    return subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                          capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
+                          cwd="/mnt/c" if os.path.isdir("/mnt/c") else None)
+
+
+def _ps_str(t: str) -> str:
+    return "'" + t.replace("'", "''") + "'"
+
+
+def touche(nom: str, fois: int = 1) -> None:
+    code = TOUCHES[nom]
+    powershell(f"$w = New-Object -ComObject WScript.Shell; 1..{max(1, min(fois, 60))} | % {{ $w.SendKeys([char]{code}) }}")
+
+
+def ouvrir(cible: str) -> None:
+    r = powershell(f"Start-Process {_ps_str(cible)}")
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout).strip().splitlines()[0] if (r.stderr or r.stdout).strip() else "échec")
+
+
+async def controle_pc(q: str) -> str | None:
+    """Ouvre une appli, gère le son et la musique, verrouille, éteint, minuteur. None si ce n'est pas une commande PC."""
+    from urllib.parse import quote
+
+    if m := MINUTEUR.search(q):
+        n = _num(m.group("n")) if m.group("n").isdigit() or m.group("n").lower() in NOMBRES else 1
+        u = m.group("u").lower()
+        delta = timedelta(hours=n) if u.startswith("h") else timedelta(seconds=n) if u.startswith("s") else timedelta(minutes=n)
+        add_reminder(datetime.now().astimezone() + delta, "⏲️ le minuteur est terminé")
+        return f"Minuteur réglé : je vous préviens dans {n} {m.group('u')}."
+    if m := PC_RECHERCHE.match(q):
+        ou, req = m.group("ou").lower(), m.group("q").strip()
+        url = {"youtube": "https://www.youtube.com/results?search_query=", "google": "https://www.google.com/search?q=",
+               "spotify": "spotify:search:"}[ou] + quote(req)
+        await asyncio.to_thread(ouvrir, url)
+        return f"J'ouvre {req} sur {ou.capitalize()}."
+    if PC_MUSIQUE.match(q):
+        await asyncio.to_thread(ouvrir, "spotify:")
+        await asyncio.sleep(4)
+        await asyncio.to_thread(touche, "lecture")
+        return "J'ouvre Spotify et je lance la musique."
+    if m := PC_MEDIA.match(q):
+        a = _sans_accents(m.group("a"))
+        nom = "suivante" if ("suiv" in a or "prochaine" in a or a.startswith("passe")) else "precedente" if "prec" in a else "lecture"
+        await asyncio.to_thread(touche, nom)
+        return {"suivante": "Chanson suivante.", "precedente": "Chanson précédente."}.get(nom, "C'est fait.")
+    if m := PC_VOLUME.search(q):
+        if m.group("pct"):
+            pct = max(0, min(100, int(m.group("pct"))))
+            await asyncio.to_thread(touche, "baisser", 50)
+            if pct:
+                await asyncio.to_thread(touche, "monter", round(pct / 2))
+            return f"Volume réglé à {pct} %."
+        sens = _sans_accents(m.group("sens") or "")
+        if m.group("muet") or sens == "coupe" or sens.startswith(("remets", "retabl")):
+            await asyncio.to_thread(touche, "muet")
+            return "Son coupé." if (m.group("muet") or sens == "coupe") else "Son rétabli."
+        await asyncio.to_thread(touche, "monter" if sens in ("monte", "augmente") else "baisser", 5)
+        return "Je monte le son." if sens in ("monte", "augmente") else "Je baisse le son."
+    if PC_ANNULE_ARRET.search(q):
+        await asyncio.to_thread(powershell, "shutdown /a")
+        _arret.clear()
+        return "Arrêt annulé, je reste allumé."
+    if PC_VERROU.search(q):
+        await asyncio.to_thread(powershell, "rundll32.exe user32.dll,LockWorkStation")
+        return "Ordinateur verrouillé."
+    if PC_ETEINDRE.search(q):
+        if _arret.get("demande") and time.time() - _arret["demande"] < 60:
+            await asyncio.to_thread(powershell, "shutdown /s /t 60")
+            _arret.clear()
+            return "L'ordinateur s'éteint dans une minute. Dites « annule l'arrêt » pour l'empêcher."
+        _arret["demande"] = time.time()
+        return "Voulez-vous vraiment éteindre l'ordinateur ? Je ne pourrai plus vous répondre. Redites-le pour confirmer."
+    if m := PC_OUVRE.match(q):
+        app = _sans_accents(m.group("app")).strip()
+        cle = next((k for k in APPLIS if _sans_accents(k) == app), None) or next(
+            (k for k in APPLIS if _sans_accents(k) in app.split() or app.endswith(_sans_accents(k))), None)
+        if not cle:
+            return None
+        cible, nom = APPLIS[cle]
+        try:
+            await asyncio.to_thread(ouvrir, cible)
+        except Exception as exc:  # noqa: BLE001
+            return f"Je n'ai pas réussi à ouvrir {nom} ({exc})."
+        return f"J'ouvre {nom}."
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Temps de trajet (OpenStreetMap : Nominatim + OSRM, gratuits, sans trafic)
+# ---------------------------------------------------------------------------
+
+TRAJET = re.compile(r"(?:(?:combien de temps|ça prend combien de temps|ca prend combien de temps|ça prend-tu combien de temps)"
+                    r".*?\b(?:pour aller|pour me rendre|pour se rendre|en auto|en voiture|en char)\b(?:\s+(?:à|au|aux|chez|jusqu.à))?"
+                    r"|temps de (?:trajet|route)\s+(?:pour aller\s+|jusqu.)?(?:à|au|aux|vers|pour|chez)"
+                    r"|(?:c.est|est-ce que c.est)\s+loin\s+(?:d.ici\s+)?(?:à|a|au|aux|jusqu.à)"
+                    r"|(?:à|a)\s+quelle distance\s+(?:est|se trouve|sont)?)\s+(?P<dest>[^?!.]+?)\s*(?:en auto|en voiture|en char|d.ici)?\s*[?.!]*$", re.I)
+UA = {"User-Agent": "JarvisVoix/1.0 (assistant personnel local)"}
+_geo_cache: dict = {}
+
+
+def geocoder(adresse: str, s: dict) -> tuple[float, float, str] | None:
+    cle = _sans_accents(adresse)
+    if cle in _geo_cache:
+        return _geo_cache[cle]
+    params = {"q": adresse, "format": "jsonv2", "limit": 1, "countrycodes": s.get("pays", "ca"), "accept-language": "fr"}
+    if s.get("dom_lat"):
+        d = 1.5
+        params.update(viewbox=f"{s['dom_lon'] - d},{s['dom_lat'] + d},{s['dom_lon'] + d},{s['dom_lat'] - d}")
+    time.sleep(1.1)  # politesse envers le service gratuit (1 requête par seconde)
+    r = httpx.get("https://nominatim.openstreetmap.org/search", params=params, headers=UA, timeout=20)
+    r.raise_for_status()
+    res = r.json()
+    out = (float(res[0]["lat"]), float(res[0]["lon"]), res[0].get("display_name", adresse)) if res else None
+    _geo_cache[cle] = out
+    return out
+
+
+def duree_trajet(dest: tuple[float, float], s: dict) -> tuple[int, float]:
+    """(minutes, km) en auto depuis la maison, sans trafic."""
+    r = httpx.get(f"https://router.project-osrm.org/route/v1/driving/{s['dom_lon']},{s['dom_lat']};{dest[1]},{dest[0]}",
+                  params={"overview": "false"}, headers=UA, timeout=20)
+    r.raise_for_status()
+    route = r.json()["routes"][0]
+    return round(route["duration"] / 60 * 1.15), route["distance"] / 1000  # +15 % pour la circulation normale
+
+
+async def repondre_trajet(q: str) -> str | None:
+    m = TRAJET.search(q)
+    if not m:
+        return None
+    s = load_settings()
+    if not s.get("dom_lat"):
+        return "Je ne connais pas encore votre adresse de départ. Ajoutez-la dans les réglages (question 11)."
+    dest = re.sub(r"^(?:la|le|les|l['’])\s+", "", m.group("dest").strip())
+    try:
+        g = await asyncio.to_thread(geocoder, dest, s)
+        if not g:
+            return f"Je n'ai pas trouvé « {dest} » sur la carte. Essayez avec la ville, par exemple : {dest}, Laval."
+        mins, km = await asyncio.to_thread(duree_trajet, g[:2], s)
+    except Exception as exc:  # noqa: BLE001
+        return f"Calcul du trajet impossible ({exc})."
+    return (f"Pour aller à {dest}, comptez environ {mins} minutes en auto ({km:.0f} km), sans compter les gros "
+            f"bouchons.")
+
+
+# ---------------------------------------------------------------------------
 # Jarvis (IA locale via Ollama)
 # ---------------------------------------------------------------------------
 
@@ -1081,7 +1444,8 @@ def system_prompt(extra: str = "") -> str:
         "Tu as accès à l'agenda, aux courriels, à la météo, aux nouvelles et à Internet : quand c'est "
         "utile, ces informations te sont fournies dans son message. Ne dis jamais que tu n'y as pas "
         "accès. Tu peux aussi créer des rappels (« rappelle-moi … »), retenir des choses (« souviens-toi que … ») "
-        "et gérer des listes (« ajoute du lait à l'épicerie »). "
+        "et gérer des listes (« ajoute du lait à l'épicerie »), répondre à ses courriels (« réponds à Amélie que … »), "
+        "ouvrir des applis et régler le son de l'ordinateur, et calculer des temps de trajet. "
         f"Nous sommes {JOURS[now.weekday()]} {now.day} {MOIS[now.month - 1]} {now.year}, "
         f"il est {fmt_hour(now)}."
     )
@@ -1587,6 +1951,23 @@ async def on_message(update, context) -> None:
         await msg.reply_text(f"L'IA ne répond pas ({exc}). Est-ce qu'Ollama tourne ?")
         return
     await say(context.bot, chat_id, answer, reply_to=msg)
+    if _brouillon.get("nouveau"):
+        _brouillon["nouveau"] = False
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+        await context.bot.send_message(chat_id, "Que fait-on de ce courriel ?", reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Envoyer", callback_data="brouillon:oui"),
+            InlineKeyboardButton("❌ Annuler", callback_data="brouillon:non")]]))
+
+
+async def on_bouton(update, context) -> None:
+    q = update.callback_query
+    if not _allowed(update):
+        await q.answer()
+        return
+    await q.answer()
+    r = await gerer_brouillon("oui" if q.data == "brouillon:oui" else "non") if _brouillon else "Ce brouillon a expiré."
+    await q.edit_message_text(r or "Ce brouillon a expiré.")
 
 
 def conversation_id() -> int:
@@ -1596,15 +1977,27 @@ def conversation_id() -> int:
 
 async def handle_question(question: str) -> str:
     """Stop, rappel, mémoire, listes, sinon question à Jarvis. Retourne le texte de la réponse."""
-    r = intention(question)
+    r = await intention(question)
     return r if r is not None else await ask_jarvis(conversation_id(), question)
 
 
-def intention(question: str) -> str | None:
-    """Les commandes qui n'ont pas besoin de l'IA (stop, rappels, mémoire, listes). None sinon."""
+async def intention(question: str) -> str | None:
+    """Les commandes directes (stop, courriels, PC, trajets, rappels, mémoire, listes). None sinon → l'IA répond."""
     if MOTS_STOP.match(question):
         stop_pc_voice()
         return "D'accord."
+    if (r := await gerer_brouillon(question)) is not None:
+        return r
+    if (m := REPONDRE.match(question)) and not re.fullmatch(r"(ma|mon|mes|la|le|les|à|a)", m.group("qui").strip(), re.I):
+        return await creer_brouillon(m, ecrire=False)
+    if m := ECRIRE.match(question):
+        return await creer_brouillon(m, ecrire=True)
+    if (m := REPONDRE_SEUL.match(question)) and not re.search(r"\b(question|moi|ça|ca|cela|ceci)\b", m.group("qui") or "", re.I):
+        return await demander_reponse((m.group("qui") or "").strip() or None)
+    if (r := await controle_pc(question)) is not None:
+        return r
+    if (r := await repondre_trajet(question)) is not None:
+        return r
     if MOTS_RAPPEL.search(question) and not MEM_AJOUT.match(question):
         parsed = parse_rappel(question)
         if parsed is None:
@@ -1849,6 +2242,9 @@ async def cmd_aide(update, context) -> None:
         "• /memoire — ce que je sais sur toi (et /oublie N)\n"
         "• /canadiens — résultats et prochain match\n"
         "• /stop — me faire taire sur l'ordi\n\n"
+        "Je peux aussi : répondre à tes courriels (« Réponds à Amélie que … » ou juste « Réponds à Amélie »), "
+        "ouvrir des applis (« Ouvre Spotify »), mettre de la musique, régler le son, verrouiller l'ordi, "
+        "lancer un minuteur et calculer un trajet (« Combien de temps pour aller à Laval ? »).\n\n"
         "Exemples : « Qu'est-ce que j'ai demain ? », « Lis-moi mes courriels », "
         "« Est-ce qu'il va neiger demain ? », « Rappelle-moi dans 20 minutes de sortir le linge », "
         "« Souviens-toi que ma blonde s'appelle Julie », « Ajoute du lait et des œufs à l'épicerie »."
@@ -1984,6 +2380,22 @@ async def watcher(app) -> None:
                 before = timedelta(minutes=int(s.get("reminder_minutes", 30)))
                 for e in await asyncio.to_thread(fetch_events, s, 1):
                     key = f"{e['uid']}|{e['start'].isoformat()}"
+                    # Rendez-vous avec un lieu : on calcule le trajet et on prévient quand partir.
+                    if (s.get("dom_lat") and e["where"] and not e["all_day"] and f"depart|{key}" not in reminded
+                            and now < e["start"] <= now + timedelta(hours=3)):
+                        if key not in _trajets:
+                            try:
+                                g = await asyncio.to_thread(geocoder, e["where"], s)
+                                _trajets[key] = (await asyncio.to_thread(duree_trajet, g[:2], s))[0] if g else None
+                            except Exception:  # noqa: BLE001
+                                _trajets[key] = None
+                        mins = _trajets.get(key)
+                        if mins and mins >= 5:
+                            depart = e["start"] - timedelta(minutes=mins + 10)
+                            if depart <= now:
+                                reminded.add(f"depart|{key}")
+                                await say(app.bot, chat_id, f"🚗 Il est temps de partir pour {e['title']} à "
+                                          f"{fmt_hour(e['start'])} : le trajet prend environ {mins} minutes.")
                     if e["all_day"] or key in reminded:
                         continue
                     if now <= e["start"] <= now + before:
@@ -2019,7 +2431,10 @@ async def watcher(app) -> None:
                             if m.get("categorie") == "pub" and not s.get("annoncer_pubs"):
                                 continue
                             pre = "Courriel important" if m.get("categorie") == "important" else "Nouveau courriel"
-                            await say(app.bot, chat_id, f"{pre} de {m['from']} : {m['subject']}.")
+                            _dernier_courriel.clear()
+                            _dernier_courriel.update(m)
+                            await say(app.bot, chat_id, f"{pre} de {m['from']} : {m['subject']}. "
+                                                        "Dites « réponds-lui » pour y répondre.")
         except Exception as exc:  # noqa: BLE001
             print(f"Courriel : {exc}", flush=True)
 
@@ -2415,7 +2830,7 @@ class SessionMicro:
         await diffuser({"t": "moi", "texte": question})
         await changer_etat("pense")
         try:
-            r = intention(question)
+            r = await intention(question)
             if r is not None:
                 await diffuser({"t": "jarvis", "texte": r})
                 if not MOTS_STOP.match(question):
@@ -2665,6 +3080,9 @@ def main() -> None:
         app.add_handler(CommandHandler("agenda", cmd_agenda))
         app.add_handler(CommandHandler("rappels", cmd_rappels))
         app.add_handler(CommandHandler("recap", cmd_recap))
+        from telegram.ext import CallbackQueryHandler
+
+        app.add_handler(CallbackQueryHandler(on_bouton, pattern=r"^brouillon:"))
         app.add_handler(CommandHandler(["memoire", "memo"], cmd_memoire))
         app.add_handler(CommandHandler("oublie", cmd_oublie))
         app.add_handler(CommandHandler(["liste", "listes"], cmd_liste))
