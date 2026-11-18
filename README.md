@@ -32,22 +32,35 @@ jarvis gui                       # interface dans le navigateur (Node.js 22+)
 Autres presets disponibles (remplacent la config) :
 `jarvis init --preset <nom> --force` avec `code-assistant`, `deep-research`, `morning-digest-mac`, `morning-digest-linux`, `scheduled-monitor`, `chat-simple`.
 
-## Parler à Jarvis depuis ton téléphone (Telegram)
+## Jarvis Voix : ton assistant dans Telegram (`jarvis_voix.py`)
 
-Jarvis tourne sur ton ordinateur ; ton téléphone lui écrit via un bot Telegram privé.
+Tu lui parles en vocal (ou par écrit) dans Telegram, il répond en texte **et en vocal**.
+Il lit tes courriels, connaît ton agenda, te rappelle tes rendez-vous et te fait un résumé le matin.
 
-1. Installe **Telegram** sur ton téléphone.
-2. Sur l'ordinateur (après `./install.sh`) : `./telephone.sh`
-3. Le script te demande :
-   - le **token du bot** : écris `/newbot` à **@BotFather** dans Telegram ;
-   - ton **Id Telegram** : écris à **@userinfobot**. Seul ton compte pourra parler au bot.
-4. Il démarre Jarvis (`jarvis serve`). Ouvre ton bot dans Telegram, appuie sur **Démarrer** et écris-lui.
+### Installation (Windows + Ubuntu/WSL)
+1. Crée un bot avec **@BotFather** (`/newbot`) et récupère ton Id avec **@userinfobot**.
+2. Mets le token et l'Id dans `~/.openjarvis/config.toml` (sections `[channel]` avec `enabled = false` et `[channel.telegram]` avec `bot_token` et `allowed_chat_ids`).
+3. Outils :
+   ```bash
+   sudo apt install -y ffmpeg zstd
+   ~/.local/bin/uv venv ~/.jarvis-voix
+   ~/.local/bin/uv pip install --python ~/.jarvis-voix/bin/python \
+     python-telegram-bot faster-whisper edge-tts httpx icalendar recurring-ical-events "av>=11,<19"
+   cp jarvis_voix.py ~/
+   ```
+4. Courriel + agenda : `~/.jarvis-voix/bin/python ~/jarvis_voix.py reglages`
+   - **Courriel** : Outlook/Hotmail bloque l'IMAP (« Basic authentication is disabled »). Solution : transférer Outlook → Gmail (outlook.live.com → ⚙️ → Courrier → Transfert), puis utiliser l'adresse Gmail, un **mot de passe d'application Google** (myaccount.google.com/apppasswords) et le serveur `imap.gmail.com`.
+   - **Agenda** : Google Agenda → ⚙️ Paramètres → ton agenda → Intégrer l'agenda → « Adresse secrète au format iCal ».
+5. Démarrage automatique avec Windows : `./demarrage-auto.sh` (retirer : `./demarrage-auto.sh retirer`).
 
-**Pour parler à voix haute** : appuie sur le 🎤 du clavier de ton téléphone (dictée) dans la conversation Telegram.
-Les messages vocaux Telegram (le bouton micro du bot) ne sont pas encore compris par OpenJarvis, seul le texte l'est.
+### Utilisation
+- Vocal 🎤 (bouton micro de Telegram) ou texte : « Qu'est-ce que j'ai demain ? », « Lis-moi mes courriels »…
+- Commandes : `/agenda`, `/courriels`, `/aide`.
+- Automatique : rappel avant chaque rendez-vous, annonce des nouveaux courriels, résumé du matin.
+- Journal : `tail -20 ~/.openjarvis/jarvis-voix.log` — Redémarrer : `pkill -f jarvis_voix.py` (relancé en 15 s).
+- Désactive la **mise en veille** de Windows, sinon Jarvis ne répond plus.
 
-Ensuite, pour relancer Jarvis : `jarvis serve`. L'ordinateur doit rester allumé et connecté.
-Le token est stocké dans `~/.openjarvis/config.toml` (droits 600) : ne le partage pas.
+Note : `telephone.sh` est l'ancienne méthode (connecteur Telegram intégré à OpenJarvis, texte seulement) ; Jarvis Voix la remplace.
 
 ## Configuration
 
