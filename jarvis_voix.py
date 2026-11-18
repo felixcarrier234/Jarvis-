@@ -15,6 +15,8 @@ Usage :
     python jarvis_voix.py            # lance l'assistant
     python jarvis_voix.py reglages   # configure courriel / agenda / rappels
     python jarvis_voix.py voix       # écouter et choisir la voix de Jarvis
+    python jarvis_voix.py modele     # choisir la meilleure IA selon la carte graphique
+    python jarvis_voix.py diagnostic # tout tester
 
 Parle directement à Ollama (le moteur d'IA local installé avec OpenJarvis).
 Lit le token Telegram, ton Id et le modèle dans ~/.openjarvis/config.toml,
@@ -136,6 +138,20 @@ def diagnostic() -> None:
         ok("Son joué sur l'ordinateur — tu l'as entendu ? Sinon vérifie le volume et la sortie audio de Windows.")
     except Exception as exc:  # noqa: BLE001
         ko(f"Son sur l'ordinateur impossible : {exc}")
+    smi = shutil.which("nvidia-smi") or ("/usr/lib/wsl/lib/nvidia-smi" if os.path.exists("/usr/lib/wsl/lib/nvidia-smi") else None)
+    if smi:
+        r = subprocess.run([smi, "--query-gpu=name,memory.total", "--format=csv,noheader"], capture_output=True, text=True)
+        ok(f"Carte graphique : {r.stdout.strip()}") if r.returncode == 0 and r.stdout.strip() else ko(
+            f"nvidia-smi ne répond pas : {r.stderr.strip()[:200]}")
+    else:
+        ko("Carte NVIDIA non visible dans Ubuntu (pilote NVIDIA pour Windows à jour ?)")
+    try:
+        ps = httpx.get(f"{OLLAMA}/api/ps", timeout=5).json().get("models", [])
+        for m in ps:
+            tot, vram = m.get("size", 0), m.get("size_vram", 0)
+            ok(f"Modèle chargé : {m.get('name')} — {round(100 * vram / tot) if tot else 0} % sur la carte graphique")
+    except Exception:  # noqa: BLE001
+        pass
     try:
         names = [m["name"] for m in httpx.get(f"{OLLAMA}/api/tags", timeout=5).json().get("models", [])]
         ok(f"Ollama répond, modèles : {', '.join(names) or 'AUCUN'} (config : {MODEL})")
@@ -147,6 +163,50 @@ def diagnostic() -> None:
     except Exception:  # noqa: BLE001
         ko("Jarvis ne tourne pas en ce moment (regarde : tail -20 ~/.openjarvis/jarvis-voix.log)")
     print("\nCopie tout ce qui est au-dessus à Claude si quelque chose est en ❌.\n")
+
+
+def choisir_modele() -> None:
+    """Choisit le meilleur modèle d'IA selon la carte graphique NVIDIA et la mémoire, puis l'installe."""
+    vram = 0.0
+    smi = shutil.which("nvidia-smi") or ("/usr/lib/wsl/lib/nvidia-smi" if os.path.exists("/usr/lib/wsl/lib/nvidia-smi") else None)
+    if smi:
+        r = subprocess.run([smi, "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
+                           capture_output=True, text=True)
+        if r.returncode == 0 and r.stdout.strip():
+            nom, mem = r.stdout.strip().splitlines()[0].rsplit(",", 1)
+            vram = float(mem) / 1024
+            print(f"Carte graphique : {nom.strip()} — {vram:.1f} Go")
+    if not vram:
+        print("Pas de carte NVIDIA visible dans Ubuntu (l'IA tournera sur le processeur).")
+    ram = 0.0
+    try:
+        ram = int(next(l for l in open("/proc/meminfo") if l.startswith("MemTotal")).split()[1]) / 1024 / 1024
+    except Exception:  # noqa: BLE001
+        pass
+    print(f"Mémoire disponible pour Ubuntu : {ram:.1f} Go")
+    if vram >= 20:
+        modele = "qwen3.5:27b"
+    elif vram >= 7 or ram >= 14:
+        modele = "qwen3.5:9b"
+    elif ram >= 7:
+        modele = "qwen3.5:4b"
+    else:
+        modele = "qwen3.5:2b"
+    print(f"\n→ Modèle conseillé : {modele}")
+    if ask("Le télécharger et l'utiliser ? (o/n)", "o").lower().startswith("o"):
+        ollama = shutil.which("ollama") or "/usr/local/bin/ollama"
+        if subprocess.run([ollama, "pull", modele]).returncode != 0:
+            print("❌ Le téléchargement a échoué. Vérifie qu'Ollama tourne (ollama serve) et réessaie.")
+            return
+        txt = CONFIG.read_text()
+        if re.search(r"(?m)^default_model\s*=", txt):
+            txt = re.sub(r"(?m)^default_model\s*=.*$", f'default_model = "{modele}"', txt)
+        elif re.search(r"(?m)^\[intelligence\]", txt):
+            txt = re.sub(r"(?m)^\[intelligence\]\s*$", f'[intelligence]\ndefault_model = "{modele}"', txt, count=1)
+        else:
+            txt += f'\n[intelligence]\ndefault_model = "{modele}"\n'
+        CONFIG.write_text(txt)
+        print(f"\n✅ Jarvis utilisera maintenant {modele}. Redémarre-le :  pkill -f jarvis_voix.py")
 
 
 def choisir_voix() -> None:
@@ -236,6 +296,13 @@ def reglages() -> None:
 
     s["pc_voice"] = ask("\n6) Parler aussi à voix haute sur l'ordinateur ? (o/n)",
                         "o" if s.get("pc_voice", True) else "n").lower().startswith("o")
+    s["soir"] = ask("\n7) Heure du résumé du soir (ex. 21:00, vide = jamais)", s.get("soir", "21:00"))
+    s["heure_alertes"] = ask("8) Heure des alertes météo pour le lendemain (ex. 18:00, vide = jamais)",
+                             s.get("heure_alertes", "18:00"))
+    s["equipe"] = ask("9) Équipe de hockey à suivre (code LNH : MTL, TOR, BOS… ; vide = aucune)",
+                      s.get("equipe", "MTL")).upper()
+    s["annoncer_pubs"] = ask("10) Annoncer aussi les courriels publicitaires ? (o/n)",
+                             "o" if s.get("annoncer_pubs") else "n").lower().startswith("o")
 
     save_settings(s)
     print(f"\nRéglages enregistrés dans {SETTINGS}\n\nTest des connexions…")
@@ -342,13 +409,16 @@ def fetch_emails(s: dict, limit: int = 8, since_uid: int = 0) -> list[dict]:
                 when = parsedate_to_datetime(msg.get("Date")).astimezone()
             except Exception:  # noqa: BLE001
                 when = None
+            subject = _dec(msg.get("Subject")) or "(sans objet)"
+            body = _body(msg)[:400]
             out.append({
                 "uid": uid,
                 "from": sender,
-                "subject": _dec(msg.get("Subject")) or "(sans objet)",
+                "subject": subject,
                 "date": when,
                 "unread": "\\Seen" not in flags,
-                "body": _body(msg)[:400],
+                "body": body,
+                "categorie": classer_courriel(msg, subject, body),
             })
         return out
     finally:
@@ -356,6 +426,30 @@ def fetch_emails(s: dict, limit: int = 8, since_uid: int = 0) -> list[dict]:
             box.logout()
         except Exception:  # noqa: BLE001
             pass
+
+
+PROMO_EXPEDITEUR = re.compile(r"no-?reply|ne-?pas-?repondre|newsletter|infolettre|marketing|promo|offres?@|deals?@|"
+                              r"news@|info@|hello@|bonjour@|notifications?@|mailer", re.I)
+PROMO_SUJET = re.compile(r"rabais|promo|solde|soldes|\d+ ?%|offre|exclusi|économisez|economisez|gratuit|webinaire|"
+                         r"infolettre|newsletter|black friday|cyber|dernière chance|derniere chance|nouveautés", re.I)
+IMPORTANT = re.compile(r"urgent|important|facture|paiement|échéance|echeance|rendez-vous|rdv|confirmation|code|"
+                       r"sécurité|securite|mot de passe|compte|livraison|colis|rembours|impôt|impot|revenu québec|"
+                       r"arc\b|banque|desjardins|hydro|loyer|bail|contrat|médecin|medecin|clinique|école|ecole|travail|"
+                       r"entrevue|réservation|reservation|vol\b|billet|réunion|reunion|meeting", re.I)
+
+
+def classer_courriel(msg, subject: str, body: str) -> str:
+    """« important », « normal » ou « pub » (publicités / infolettres)."""
+    expediteur = str(msg.get("From", ""))
+    pub = bool(msg.get("List-Unsubscribe")) or str(msg.get("Precedence", "")).lower() in ("bulk", "list")
+    if not pub and PROMO_EXPEDITEUR.search(expediteur) and PROMO_SUJET.search(subject):
+        pub = True
+    texte = f"{subject} {body[:200]}"
+    if IMPORTANT.search(texte) and not (pub and PROMO_SUJET.search(subject)):
+        return "important"
+    if pub or PROMO_SUJET.search(subject):
+        return "pub"
+    return "normal"
 
 
 def last_uid(s: dict) -> int:
@@ -373,7 +467,8 @@ def emails_text(mails: list[dict]) -> str:
     for m in mails:
         when = fmt_when(m["date"]) if m["date"] else ""
         etat = "NON LU" if m["unread"] else "lu"
-        lines.append(f"- [{etat}] {when} — De : {m['from']} — Objet : {m['subject']}\n  Début : {m['body'][:250]}")
+        cat = {"important": " [IMPORTANT]", "pub": " [PUB]"}.get(m.get("categorie", ""), "")
+        lines.append(f"- [{etat}]{cat} {when} — De : {m['from']} — Objet : {m['subject']}\n  Début : {m['body'][:250]}")
     return "\n".join(lines) or "(aucun courriel)"
 
 
@@ -476,7 +571,8 @@ def weather_data(s: dict) -> dict:
     r = httpx.get("https://api.open-meteo.com/v1/forecast", timeout=20, params={
         "latitude": s["lat"], "longitude": s["lon"], "timezone": "auto", "forecast_days": 3,
         "current": "temperature_2m,apparent_temperature,weather_code,wind_speed_10m",
-        "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max",
+        "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,"
+                 "snowfall_sum,precipitation_sum,wind_gusts_10m_max",
     })
     r.raise_for_status()
     d = r.json()
@@ -488,6 +584,10 @@ def weather_data(s: dict) -> dict:
             "ciel": METEO_CODES.get(dd["weather_code"][i], "variable"),
             "min": round(dd["temperature_2m_min"][i]), "max": round(dd["temperature_2m_max"][i]),
             "pluie": dd["precipitation_probability_max"][i],
+            "code": dd["weather_code"][i],
+            "neige_cm": round((dd.get("snowfall_sum") or [0] * 9)[i] or 0),
+            "precip_mm": round((dd.get("precipitation_sum") or [0] * 9)[i] or 0),
+            "rafales": round((dd.get("wind_gusts_10m_max") or [0] * 9)[i] or 0),
         })
     return {
         "ville": s.get("city_label") or s.get("city"),
@@ -652,6 +752,284 @@ def add_reminder(when: datetime, what: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Mémoire à long terme, listes, anniversaires, alertes météo, Canadiens
+# ---------------------------------------------------------------------------
+
+MEMOIRE = HOME / "memoire.json"
+LISTES = HOME / "listes.json"
+ETAT = HOME / "etat.json"
+
+
+def _load(path: Path, default):
+    try:
+        return json.loads(path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default
+
+
+def _save(path: Path, data) -> None:
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+
+
+def _sans_accents(t: str) -> str:
+    import unicodedata
+
+    return "".join(c for c in unicodedata.normalize("NFD", t.lower()) if unicodedata.category(c) != "Mn")
+
+
+# --- Mémoire ---------------------------------------------------------------
+
+MEM_AJOUT = re.compile(r"^\s*(?:jarvis\W+)?(?:souviens[- ]toi|rappelle[- ]toi|retiens|m[ée]morise|n.oublie pas|"
+                       r"garde en m[ée]moire|note bien|note)\s+(?:bien\s+)?(?:que\s+|qu['’]|de\s+|ceci\s*:\s*|ça\s*:\s*)"
+                       r"(?P<fait>.+)$", re.I)
+MEM_OUBLI = re.compile(r"^\s*(?:jarvis\W+)?(?:oublie|efface de ta m[ée]moire|supprime de ta m[ée]moire)\s+"
+                       r"(?:ce que je t.ai dit (?:sur|à propos de)\s+|que\s+|qu['’]|l.info sur\s+|tout sur\s+)?(?P<quoi>.+)$", re.I)
+MEM_LISTE = re.compile(r"(qu.est-ce que tu sais|que sais-tu|tu sais quoi|qu.as-tu retenu|qu.est-ce que tu as retenu|"
+                       r"ta m[ée]moire)", re.I)
+ANNIV = re.compile(r"anniversaire\s+(?:de\s+|d['’])(?P<nom>[\w'’ -]+?)\s+(?:est\s+|c.est\s+|tombe\s+)?le\s+"
+                   r"(?P<j>\d{1,2})(?:er)?\s+(?P<m>[a-zéû]+)", re.I)
+NAISSANCE = re.compile(r"(?P<nom>[A-ZÉ][\w'’-]+(?:\s+[A-ZÉ][\w'’-]+)?)\s+est\s+n[ée]e?\s+le\s+(?P<j>\d{1,2})(?:er)?\s+"
+                       r"(?P<m>[a-zéû]+)", re.I)
+
+
+def memoire() -> list[dict]:
+    return _load(MEMOIRE, [])
+
+
+def memoire_ajoute(fait: str) -> str:
+    fait = fait.strip(" .!?")
+    items = memoire()
+    if not any(_sans_accents(i["fait"]) == _sans_accents(fait) for i in items):
+        items.append({"fait": fait, "date": datetime.now().astimezone().date().isoformat()})
+        _save(MEMOIRE, items)
+    return fait
+
+
+def deuxieme_personne(t: str) -> str:
+    """« ma blonde s'appelle Julie » → « ta blonde s'appelle Julie » (pour les confirmations)."""
+    rempl = [(r"\bje suis\b", "tu es"), (r"\bj['’]ai\b", "tu as"), (r"\bje\b", "tu"), (r"\bma\b", "ta"),
+             (r"\bmon\b", "ton"), (r"\bmes\b", "tes"), (r"\bme\b", "te"), (r"\bmoi\b", "toi"), (r"\bm['’]", "t'")]
+    for a, b in rempl:
+        t = re.sub(a, b, t, flags=re.I)
+    return t
+
+
+def memoire_oublie(quoi: str) -> list[str]:
+    quoi = quoi.strip(" .!?")
+    items = memoire()
+    if re.fullmatch(r"(ça|ca|cela|ce que je viens de dire|la dernière chose)", quoi, re.I) and items:
+        enleves = [items.pop()["fait"]]
+    else:
+        vides = {"les", "des", "une", "que", "qui", "sur", "mon", "mes", "ton", "tes", "son", "ses", "aux", "pour",
+                 "dans", "avec", "est", "sont", "ete", "tout", "propos", "concernant", "info", "infos"}
+        mots = [w for w in re.findall(r"\w+", _sans_accents(quoi)) if len(w) > 2 and w not in vides]
+        garde, enleves = [], []
+        for i in items:
+            (enleves if mots and all(w in _sans_accents(i["fait"]) for w in mots) else garde).append(i)
+        items = garde
+        enleves = [i["fait"] for i in enleves]
+    _save(MEMOIRE, items)
+    return enleves
+
+
+def memoire_texte() -> str:
+    items = memoire()[-60:]
+    return "\n".join(f"- {i['fait']}" for i in items)
+
+
+def anniversaires() -> list[dict]:
+    """Anniversaires trouvés dans la mémoire : [{nom, jour, mois}]."""
+    out = []
+    for i in memoire():
+        for rx in (ANNIV, NAISSANCE):
+            m = rx.search(i["fait"])
+            if m:
+                mois = _sans_accents(m.group("m"))
+                noms = [_sans_accents(x) for x in MOIS]
+                if mois in noms:
+                    out.append({"nom": m.group("nom").strip(), "jour": int(m.group("j")), "mois": noms.index(mois) + 1})
+                break
+    return out
+
+
+def anniversaires_proches(jours: int = 7) -> list[dict]:
+    today = datetime.now().astimezone().date()
+    out = []
+    for a in anniversaires():
+        for an in (today.year, today.year + 1):
+            try:
+                d = date(an, a["mois"], a["jour"])
+            except ValueError:
+                continue
+            if 0 <= (d - today).days <= jours:
+                out.append({**a, "dans": (d - today).days, "date": d})
+                break
+    return sorted(out, key=lambda a: a["dans"])
+
+
+# --- Listes (épicerie, tâches, …) ------------------------------------------
+
+LISTE_NOM = r"(?:la\s+|ma\s+|les\s+|mes\s+|l['’])?(?:liste(?:\s+(?:d['’]|de\s+(?:l['’])?|des\s+|du\s+|de\s+la\s+)?(?P<liste>[\w'’ -]+?))?|(?P<connue>épicerie|epicerie|courses|commissions|tâches|taches|choses à faire|to-?do))"
+LISTE_AJOUT = re.compile(r"^\s*(?:jarvis\W+)?(?:ajoute|rajoute|mets|met|inscris|ajouter)\s+(?P<items>.+?)\s+(?:à|a|dans|sur)\s+"
+                         + LISTE_NOM + r"\s*[.!?]*$", re.I)
+LISTE_RETIRE = re.compile(r"^\s*(?:jarvis\W+)?(?:enlève|enleve|retire|supprime|efface|coche|raye|barre)\s+(?P<items>.+?)\s+"
+                          r"(?:de|du|des|d['’]|à|a|sur|dans)\s+" + LISTE_NOM + r"\s*[.!?]*$", re.I)
+LISTE_ACHETE = re.compile(r"^\s*(?:jarvis\W+)?j.ai\s+(?:acheté|achete|pris|trouvé)\s+(?P<items>.+?)\s*[.!?]*$", re.I)
+LISTE_FAIT = re.compile(r"^\s*(?:jarvis\W+)?j.ai\s+(?:fini|terminé|termine|fait)\s+(?:de\s+|d['’])?(?P<items>.+?)\s*[.!?]*$", re.I)
+LISTE_LIRE = re.compile(r"(qu.est-ce qu.il y a|qu.y a-t-il|lis|lire|dis-moi|c.est quoi|montre|affiche|il me reste quoi|"
+                        r"qu.est-ce qu.il me reste)\b.*\b(liste|épicerie|epicerie|courses|tâches|taches|choses à faire|acheter)", re.I)
+LISTE_VIDE = re.compile(r"^\s*(?:jarvis\W+)?(?:vide|efface|supprime)\s+(?:toute\s+)?" + LISTE_NOM + r"\s*[.!?]*$", re.I)
+
+
+def _nom_liste(m) -> str:
+    raw = (m.group("connue") or m.group("liste") or "").lower().strip()
+    a = _sans_accents(raw)
+    if any(k in a for k in ("epicerie", "course", "commission", "acheter", "magasin")):
+        return "épicerie"
+    if any(k in a for k in ("tache", "faire", "todo", "to-do", "to do")):
+        return "tâches"
+    return raw or "épicerie"
+
+
+def _articles(item: str) -> str:
+    return re.sub(r"^(?:du|de la|de l['’]|des|d['’]|un|une|le|la|les|l['’]|mes|mon|ma)\s*", "", item.strip(" .!?"),
+                  flags=re.I).strip()
+
+
+def _split_items(items: str) -> list[str]:
+    return [_articles(x) for x in re.split(r"\s*,\s*|\s+et\s+|\s+puis\s+", items) if _articles(x)]
+
+
+def listes() -> dict:
+    return _load(LISTES, {})
+
+
+def liste_texte(nom: str) -> str:
+    items = listes().get(nom, [])
+    return f"Ta liste {'d' + chr(39) if nom[0] in 'aeéiou' else 'de '}{nom} est vide." if not items else \
+        f"Sur ta liste {'d' + chr(39) if nom[0] in 'aeéiou' else 'de '}{nom} : {', '.join(items)}."
+
+
+def gerer_listes(q: str) -> str | None:
+    """Ajoute / retire / lit / vide une liste. Retourne la réponse, ou None si ce n'est pas une phrase de liste."""
+    data = listes()
+    if m := LISTE_VIDE.match(q):
+        nom = _nom_liste(m)
+        data[nom] = []
+        _save(LISTES, data)
+        return f"J'ai vidé ta liste {'d' + chr(39) if nom[0] in 'aeéiou' else 'de '}{nom}."
+    if m := LISTE_AJOUT.match(q):
+        if not (m.group("connue") or re.search(r"\bliste\b", q, re.I)):
+            return None
+        nom, items = _nom_liste(m), _split_items(m.group("items"))
+        cur = data.setdefault(nom, [])
+        cur += [i for i in items if _sans_accents(i) not in map(_sans_accents, cur)]
+        _save(LISTES, data)
+        return f"C'est ajouté à ta liste {'d' + chr(39) if nom[0] in 'aeéiou' else 'de '}{nom} : {', '.join(items)}."
+    m = LISTE_RETIRE.match(q)
+    nom = _nom_liste(m) if m else "épicerie" if (m := LISTE_ACHETE.match(q)) else "tâches" if (m := LISTE_FAIT.match(q)) else None
+    if m and nom:
+        if LISTE_RETIRE.match(q) and not (m.group("connue") or re.search(r"\bliste\b", q, re.I)):
+            return None
+        cur = data.get(nom, [])
+        enleves = []
+        for it in _split_items(m.group("items")):
+            for x in list(cur):
+                if _sans_accents(it) in _sans_accents(x) or _sans_accents(x) in _sans_accents(it):
+                    cur.remove(x)
+                    enleves.append(x)
+        if not enleves:
+            if LISTE_ACHETE.match(q) or LISTE_FAIT.match(q):
+                return None
+            return f"Je n'ai pas trouvé ça sur ta liste {'d' + chr(39) if nom[0] in 'aeéiou' else 'de '}{nom}."
+        data[nom] = cur
+        _save(LISTES, data)
+        reste = f" Il reste : {', '.join(cur)}." if cur else " La liste est maintenant vide."
+        return f"C'est fait, j'ai retiré {', '.join(enleves)}.{reste}"
+    if LISTE_LIRE.search(q):
+        a = _sans_accents(q)
+        if any(k in a for k in ("tache", "a faire")):
+            return liste_texte("tâches")
+        autres = [n for n in data if _sans_accents(n) in a and n not in ("épicerie", "tâches")]
+        return liste_texte(autres[0] if autres else "épicerie")
+    return None
+
+
+# --- Alertes météo ---------------------------------------------------------
+
+def alertes_meteo(w: dict, index: int = 1) -> list[str]:
+    """Alertes utiles pour le jour index (0 = aujourd'hui, 1 = demain)."""
+    if len(w.get("jours", [])) <= index:
+        return []
+    j = w["jours"][index]
+    quand = j["nom"].lower()
+    out = []
+    if j.get("neige_cm", 0) >= 5:
+        out.append(f"Il va tomber environ {j['neige_cm']} cm de neige {quand} : prévoir la pelle et plus de temps pour la route.")
+    if j.get("code") in (56, 57, 66, 67):
+        out.append(f"Risque de verglas {quand} : prudence sur la route et sur les trottoirs.")
+    if j.get("min", 0) <= -20:
+        out.append(f"Grand froid {quand} : jusqu'à {j['min']} °C. Pensez à brancher l'auto et à bien vous couvrir.")
+    if j.get("rafales", 0) >= 70:
+        out.append(f"Vents forts {quand}, avec des rafales jusqu'à {j['rafales']} km/h.")
+    if j.get("precip_mm", 0) >= 20 and j.get("neige_cm", 0) < 5:
+        out.append(f"Fortes pluies {quand} : environ {j['precip_mm']} mm.")
+    return out
+
+
+# --- Canadiens (API publique de la LNH) ------------------------------------
+
+def nhl_info(equipe: str = "MTL") -> dict:
+    r = httpx.get(f"https://api-web.nhle.com/v1/club-schedule-season/{equipe}/now", timeout=20, follow_redirects=True)
+    r.raise_for_status()
+    games = r.json().get("games", [])
+
+    def nom(t):
+        return (t.get("placeName") or {}).get("default") or (t.get("commonName") or {}).get("default") or t.get("abbrev", "?")
+
+    def decrit(g):
+        dom = g["homeTeam"].get("abbrev") == equipe
+        nous, eux = (g["homeTeam"], g["awayTeam"]) if dom else (g["awayTeam"], g["homeTeam"])
+        debut = datetime.fromisoformat(g["startTimeUTC"].replace("Z", "+00:00")).astimezone()
+        d = {"id": g.get("id"), "adversaire": nom(eux), "domicile": dom, "debut": debut, "etat": g.get("gameState", "")}
+        if "score" in nous and "score" in eux:
+            d.update(nous=nous["score"], eux=eux["score"])
+            fin = (g.get("gameOutcome") or {}).get("lastPeriodType", "")
+            d["prolong"] = {"OT": " en prolongation", "SO": " en tirs de barrage"}.get(fin, "")
+        return d
+
+    finis = [decrit(g) for g in games if g.get("gameState") in ("FINAL", "OFF")]
+    futurs = [decrit(g) for g in games if g.get("gameState") in ("FUT", "PRE")]
+    live = [decrit(g) for g in games if g.get("gameState") in ("LIVE", "CRIT")]
+    return {"dernier": finis[-1] if finis else None, "prochain": futurs[0] if futurs else None,
+            "en_cours": live[0] if live else None}
+
+
+def nhl_phrase(d: dict | None, type_: str) -> str:
+    if not d:
+        return ""
+    ou = "à domicile" if d["domicile"] else "à l'extérieur"
+    if type_ == "dernier":
+        res = "a gagné" if d["nous"] > d["eux"] else "a perdu"
+        return (f"Le Canadien {res} {max(d['nous'], d['eux'])} à {min(d['nous'], d['eux'])}{d.get('prolong', '')} "
+                f"contre {d['adversaire']} ({fmt_day(d['debut'].date())}).")
+    if type_ == "en_cours":
+        return f"Match en cours contre {d['adversaire']} : {d.get('nous', 0)} à {d.get('eux', 0)} pour " + (
+            "le Canadien." if d.get("nous", 0) > d.get("eux", 0) else "l'adversaire." if d.get("eux", 0) > d.get("nous", 0)
+            else "personne, c'est égal.")
+    return f"Prochain match : {fmt_when(d['debut'])} contre {d['adversaire']}, {ou}."
+
+
+def nhl_texte(info: dict) -> str:
+    return " ".join(x for x in (nhl_phrase(info.get("en_cours"), "en_cours"), nhl_phrase(info.get("dernier"), "dernier"),
+                                nhl_phrase(info.get("prochain"), "prochain")) if x)
+
+
+MOTS_HOCKEY = re.compile(r"canadien|\ble ch\b|\bhabs\b|hockey|\bmatch\b|\bgame\b", re.I)
+MOTS_STOP = re.compile(r"^\s*(?:jarvis\W+)?(stop|arr[eê]te|tais[- ]toi|chut|silence|ça suffit|ca suffit|assez)\s*[.!]*\s*$", re.I)
+
+
+# ---------------------------------------------------------------------------
 # Jarvis (IA locale via Ollama)
 # ---------------------------------------------------------------------------
 
@@ -672,10 +1050,15 @@ def system_prompt(extra: str = "") -> str:
         "à voix haute. N'utilise pas de listes, d'emojis ni de mise en forme. "
         "Tu as accès à l'agenda, aux courriels, à la météo, aux nouvelles et à Internet : quand c'est "
         "utile, ces informations te sont fournies dans son message. Ne dis jamais que tu n'y as pas "
-        "accès. Tu peux aussi créer des rappels : l'utilisateur doit dire « rappelle-moi … ». "
+        "accès. Tu peux aussi créer des rappels (« rappelle-moi … »), retenir des choses (« souviens-toi que … ») "
+        "et gérer des listes (« ajoute du lait à l'épicerie »). "
         f"Nous sommes {JOURS[now.weekday()]} {now.day} {MOIS[now.month - 1]} {now.year}, "
         f"il est {fmt_hour(now)}."
     )
+    faits = memoire_texte()
+    if faits:
+        base += ("\n\nCe que tu sais sur l'utilisateur (notes qu'il t'a dictées : « je », « ma », « mon » = "
+                 "l'utilisateur ; utilise-les naturellement quand c'est utile) :\n" + faits)
     if load_settings().get("majordome"):
         base += (" Tu t'exprimes comme un majordome britannique distingué, posé et pince-sans-rire : "
                  "tu vouvoies l'utilisateur et l'appelles « Monsieur », avec une pointe d'humour discret.")
@@ -746,7 +1129,14 @@ async def gather_context(question: str, s: dict) -> str:
             parts.append("NOUVELLES DU JOUR (titres) :\n" + "\n".join(f"- {t}" for t in titres))
         except Exception as exc:  # noqa: BLE001
             parts.append(f"NOUVELLES : impossibles à lire ({exc}).")
-    if MOTS_WEB.search(question):
+    if MOTS_HOCKEY.search(question) and s.get("equipe", "MTL"):
+        try:
+            parts.append("CANADIENS DE MONTRÉAL : " + nhl_texte(await asyncio.to_thread(nhl_info, s.get("equipe", "MTL"))))
+        except Exception as exc:  # noqa: BLE001
+            parts.append(f"HOCKEY : résultats indisponibles ({exc}).")
+    if re.search(r"\bliste|épicerie|epicerie|tâches|taches", question, re.I):
+        parts.append("LISTES : " + "; ".join(f"{n} : {', '.join(v) or 'vide'}" for n, v in listes().items()) or "aucune")
+    if MOTS_WEB.search(question) and not MOTS_HOCKEY.search(question):
         try:
             parts.append(f"RÉSULTATS DE RECHERCHE INTERNET pour « {question} » :\n"
                          + await asyncio.to_thread(web_search, question))
@@ -825,6 +1215,15 @@ async def speak(text: str, workdir: str) -> str:
 
 _pc_lock = asyncio.Lock()
 _bg_tasks: set = set()
+_lecture = {"gen": 0, "proc": None}
+
+
+def stop_pc_voice() -> None:
+    """Coupe la voix sur l'ordinateur (et annule les phrases en attente)."""
+    _lecture["gen"] += 1
+    proc = _lecture.get("proc")
+    if proc is not None and proc.poll() is None:
+        proc.terminate()
 
 
 _win_temp_cache: dict = {}
@@ -871,19 +1270,35 @@ def _play_cmd(wav: Path) -> tuple[list[str], str | None]:
 async def speak_on_pc(text: str, wait: bool = False, s: dict | None = None) -> None:
     """Dit le texte sur les haut-parleurs de l'ordinateur (Windows via WSL, ou Linux).
     Avec wait=True, attend la fin et lève une erreur claire si le son n'a pas pu être joué."""
+    gen = _lecture["gen"]
     out_dir = await asyncio.to_thread(_win_temp) or Path(tempfile.gettempdir()) / "jarvis-voix"
     out_dir.mkdir(exist_ok=True)
     wav = out_dir / f"{time.time_ns()}.wav"
-    await synth(text, str(wav), s)
+    if text == "<carillon>":
+        await asyncio.to_thread(subprocess.run, [
+            "ffmpeg", "-nostdin", "-y", "-loglevel", "error",
+            "-f", "lavfi", "-i", "sine=f=660:d=0.12", "-f", "lavfi", "-i", "sine=f=880:d=0.12",
+            "-f", "lavfi", "-i", "sine=f=1320:d=0.35", "-filter_complex",
+            "[0][1][2]concat=n=3:v=0:a=1,afade=t=out:st=0.35:d=0.24,aecho=0.8:0.5:60:0.3,volume=0.5", str(wav)],
+            check=True)
+    else:
+        await synth(text, str(wav), s)
     cmd, cwd = _play_cmd(wav)
 
     async def play():
         try:
             async with _pc_lock:  # une phrase à la fois
-                r = await asyncio.to_thread(subprocess.run, cmd, cwd=cwd, capture_output=True, text=True,
-                                            timeout=300, stdin=subprocess.DEVNULL)
-            if r.returncode != 0:
-                raise RuntimeError(f"le lecteur audio a échoué : {(r.stderr or r.stdout).strip()[-400:]}")
+                if gen != _lecture["gen"]:
+                    return  # « stop » demandé entre-temps
+                proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                        stdin=subprocess.DEVNULL, text=True)
+                _lecture["proc"] = proc
+                try:
+                    out, err = await asyncio.to_thread(proc.communicate, timeout=300)
+                finally:
+                    _lecture["proc"] = None
+            if proc.returncode != 0 and gen == _lecture["gen"]:
+                raise RuntimeError(f"le lecteur audio a échoué : {(err or out).strip()[-400:]}")
         finally:
             wav.unlink(missing_ok=True)
 
@@ -959,14 +1374,30 @@ def conversation_id() -> int:
 
 
 async def handle_question(question: str) -> str:
-    """Rappel perso, sinon question à Jarvis. Retourne le texte de la réponse."""
-    if MOTS_RAPPEL.search(question):
+    """Stop, rappel, mémoire, listes, sinon question à Jarvis. Retourne le texte de la réponse."""
+    if MOTS_STOP.match(question):
+        stop_pc_voice()
+        return "D'accord."
+    if MOTS_RAPPEL.search(question) and not MEM_AJOUT.match(question):
         parsed = parse_rappel(question)
         if parsed is None:
             return "Je veux bien, mais pour quand ? Dis par exemple : rappelle-moi demain à 9 h d'appeler maman."
         when, what = parsed
         add_reminder(when, what)
         return f"C'est noté : je te rappellerai {fmt_when(when)} : {what}."
+    if m := MEM_AJOUT.match(question):
+        fait = memoire_ajoute(m.group("fait"))
+        return f"C'est noté, je m'en souviendrai : {deuxieme_personne(fait)}."
+    if m := MEM_OUBLI.match(question):
+        enleves = memoire_oublie(m.group("quoi"))
+        return ("C'est oublié : " + " ; ".join(map(deuxieme_personne, enleves)) + ".") if enleves else \
+            "Je n'avais rien retenu là-dessus."
+    if MEM_LISTE.search(question) and re.search(r"\bmoi\b|retenu|mémoire|memoire", question, re.I):
+        faits = [i["fait"] for i in memoire()]
+        return ("Voici ce que je sais sur toi : " + " ; ".join(map(deuxieme_personne, faits)) + ".") if faits else \
+            "Je ne sais encore rien sur toi. Dis-moi par exemple : souviens-toi que j'adore le café."
+    if (rep_liste := gerer_listes(question)) is not None:
+        return rep_liste
     return await ask_jarvis(conversation_id(), question)
 
 
@@ -1102,6 +1533,80 @@ async def cmd_recap(update, context) -> None:
     await say(context.bot, update.effective_chat.id, texte)
 
 
+async def _repondre_cmd(update, context, texte: str, voix: bool = True) -> None:
+    if voix:
+        await say(context.bot, update.effective_chat.id, texte)
+    else:
+        await update.effective_message.reply_text(texte)
+
+
+async def cmd_memoire(update, context) -> None:
+    if not _allowed(update):
+        return
+    items = memoire()
+    if not items:
+        await _repondre_cmd(update, context, "Je ne sais encore rien sur toi. Dis-moi : « souviens-toi que … ».", False)
+        return
+    await _repondre_cmd(update, context, "🧠 Ce que je sais sur toi :\n" + "\n".join(
+        f"{i}. {x['fait']}" for i, x in enumerate(items, 1)) + "\n\nPour en effacer un : /oublie suivi du numéro.", False)
+
+
+async def cmd_oublie(update, context) -> None:
+    if not _allowed(update):
+        return
+    items = memoire()
+    try:
+        x = items.pop(int(context.args[0]) - 1)
+    except (IndexError, ValueError):
+        await _repondre_cmd(update, context, "Écris /oublie suivi du numéro (voir /memoire).", False)
+        return
+    _save(MEMOIRE, items)
+    await _repondre_cmd(update, context, f"C'est oublié : {x['fait']}.", False)
+
+
+async def cmd_liste(update, context) -> None:
+    if not _allowed(update):
+        return
+    nom = " ".join(context.args).strip().lower() or None
+    data = listes()
+    if not nom:
+        if not any(data.values()):
+            await _repondre_cmd(update, context, "Tes listes sont vides. Dis : « ajoute du lait à l'épicerie ».", False)
+            return
+        await _repondre_cmd(update, context, "\n\n".join(f"📝 {n} :\n" + "\n".join(f"• {i}" for i in v)
+                                                          for n, v in data.items() if v), False)
+        return
+    await _repondre_cmd(update, context, liste_texte("épicerie" if "pic" in nom else "tâches" if "tâch" in nom
+                                                     or "tach" in nom else nom), False)
+
+
+async def cmd_epicerie(update, context) -> None:
+    if _allowed(update):
+        await _repondre_cmd(update, context, liste_texte("épicerie"), False)
+
+
+async def cmd_taches(update, context) -> None:
+    if _allowed(update):
+        await _repondre_cmd(update, context, liste_texte("tâches"), False)
+
+
+async def cmd_stop(update, context) -> None:
+    if _allowed(update):
+        stop_pc_voice()
+        await update.effective_message.reply_text("🤫 D'accord.")
+
+
+async def cmd_canadiens(update, context) -> None:
+    if not _allowed(update):
+        return
+    try:
+        texte = nhl_texte(await asyncio.to_thread(nhl_info, load_settings().get("equipe", "MTL")))
+    except Exception as exc:  # noqa: BLE001
+        await update.effective_message.reply_text(f"Résultats indisponibles : {exc}")
+        return
+    await _repondre_cmd(update, context, "🏒 " + (texte or "Pas de match trouvé."))
+
+
 async def cmd_aide(update, context) -> None:
     await update.effective_message.reply_text(
         "Je suis Jarvis 🤖\n\n"
@@ -1112,9 +1617,14 @@ async def cmd_aide(update, context) -> None:
         "• /meteo — la météo\n"
         "• /nouvelles — les titres du moment\n"
         "• /cherche … — chercher sur Internet\n"
-        "• /rappels — tes rappels (et /effacer N)\n\n"
+        "• /rappels — tes rappels (et /effacer N)\n"
+        "• /liste, /epicerie, /taches — tes listes\n"
+        "• /memoire — ce que je sais sur toi (et /oublie N)\n"
+        "• /canadiens — résultats et prochain match\n"
+        "• /stop — me faire taire sur l'ordi\n\n"
         "Exemples : « Qu'est-ce que j'ai demain ? », « Lis-moi mes courriels », "
-        "« Est-ce qu'il va neiger demain ? », « Rappelle-moi dans 20 minutes de sortir le linge »."
+        "« Est-ce qu'il va neiger demain ? », « Rappelle-moi dans 20 minutes de sortir le linge », "
+        "« Souviens-toi que ma blonde s'appelle Julie », « Ajoute du lait et des œufs à l'épicerie »."
     )
 
 
@@ -1135,9 +1645,10 @@ async def collect_overview(s: dict) -> dict:
 
     async def courriels():
         mails = await asyncio.to_thread(fetch_emails, s, 15)
-        out["courriels"] = [{"de": m["from"], "objet": m["subject"],
+        out["courriels"] = [{"de": m["from"], "objet": m["subject"], "categorie": m.get("categorie", "normal"),
                              "quand": fmt_when(m["date"]) if m["date"] else "", "debut": m["body"][:200]}
-                            for m in mails if m["unread"]]
+                            for m in mails if m["unread"] and m.get("categorie") != "pub"]
+        out["pubs"] = sum(1 for m in mails if m["unread"] and m.get("categorie") == "pub")
 
     async def meteo():
         out["meteo"] = await asyncio.to_thread(weather_data, s)
@@ -1145,8 +1656,12 @@ async def collect_overview(s: dict) -> dict:
     async def nouvelles():
         out["nouvelles"] = await asyncio.to_thread(fetch_news, s, 4)
 
+    async def hockey():
+        out["hockey"] = nhl_texte(await asyncio.to_thread(nhl_info, s.get("equipe", "MTL")))
+
     jobs = {"agenda": (s.get("ics_url"), agenda), "courriels": (s.get("email"), courriels),
-            "meteo": (s.get("lat"), meteo), "nouvelles": (s.get("news_url"), nouvelles)}
+            "meteo": (s.get("lat"), meteo), "nouvelles": (s.get("news_url"), nouvelles),
+            "hockey": (s.get("equipe", "MTL"), hockey)}
     actifs = [(nom, fn) for nom, (ok, fn) in jobs.items() if ok]
     results = await asyncio.gather(*(fn() for _, fn in actifs), return_exceptions=True)
     for (nom, _), res in zip(actifs, results):
@@ -1157,6 +1672,10 @@ async def collect_overview(s: dict) -> dict:
     out["rappels"] = [{"quand": fmt_when(datetime.fromisoformat(r["when"])), "quoi": r["what"]}
                       for r in load_reminders() if datetime.fromisoformat(r["when"]) <= limite]
     out["heure"] = fmt_hour(now)
+    out["listes"] = {n: v for n, v in listes().items() if v}
+    out["anniversaires"] = [{"nom": a["nom"], "quand": fmt_day(a["date"])} for a in anniversaires_proches(7)]
+    if "meteo" in out:
+        out["alertes"] = alertes_meteo(out["meteo"], 0) + alertes_meteo(out["meteo"], 1)
     return out
 
 
@@ -1173,15 +1692,24 @@ def overview_text(o: dict) -> str:
     if o.get("rappels") is not None:
         parts.append("RAPPELS À VENIR :\n" + ("\n".join(f"- {r['quand']} : {r['quoi']}" for r in o["rappels"])
                                              or "(aucun)"))
+    if o.get("alertes"):
+        parts.append("ALERTES MÉTÉO :\n" + "\n".join(f"- {a}" for a in o["alertes"]))
     if "courriels" in o:
-        parts.append(f"COURRIELS NON LUS ({len(o['courriels'])}) :\n"
-                     + ("\n".join(f"- De {m['de']} : {m['objet']}" for m in o["courriels"][:8]) or "(aucun)"))
+        parts.append(f"COURRIELS NON LUS ({len(o['courriels'])}, sans compter {o.get('pubs', 0)} publicités) :\n"
+                     + ("\n".join(f"- {'[IMPORTANT] ' if m.get('categorie') == 'important' else ''}De {m['de']} : "
+                                  f"{m['objet']}" for m in o["courriels"][:8]) or "(aucun)"))
+    if o.get("anniversaires"):
+        parts.append("ANNIVERSAIRES À VENIR :\n" + "\n".join(f"- {a['nom']} : {a['quand']}" for a in o["anniversaires"]))
+    if o.get("listes"):
+        parts.append("LISTES : " + " ; ".join(f"{n} ({len(v)}) : {', '.join(v[:8])}" for n, v in o["listes"].items()))
+    if o.get("hockey"):
+        parts.append("CANADIENS : " + o["hockey"])
     if "nouvelles" in o:
         parts.append("NOUVELLES :\n" + "\n".join(f"- {t}" for t in o["nouvelles"]))
     return "\n\n".join(parts)
 
 
-async def recap_text(o: dict, matin: bool = False) -> str:
+async def recap_text(o: dict, matin: bool = False, soir: bool = False) -> str:
     h = datetime.now().astimezone().hour
     salut = "Bonjour" if h < 12 else "Bon après-midi" if h < 18 else "Bonsoir"
     consigne = (
@@ -1191,6 +1719,11 @@ async def recap_text(o: dict, matin: bool = False) -> str:
     )
     if matin:
         consigne = "C'est mon résumé du matin, souhaite-moi bonne journée. " + consigne
+    if soir:
+        consigne = (f"C'est mon résumé du soir (il est {o['heure']}). Commence par « Bonsoir », puis en 4 à 6 phrases : "
+                    "ce qui m'attend DEMAIN (rendez-vous, rappels, météo et alertes), les anniversaires proches, "
+                    "les courriels importants non lus et ce qui reste sur mes listes. Termine par une phrase "
+                    "pour me souhaiter une bonne soirée. Ne mentionne pas ce qui est vide.")
     text = await llm([
         {"role": "system", "content": system_prompt()},
         {"role": "user", "content": "Voici mes vraies données :\n\n" + overview_text(o) + "\n\n" + consigne},
@@ -1213,6 +1746,8 @@ async def watcher(app) -> None:
     seen_uid = 0
     last_morning = None
     last_mail_check = 0.0
+    last_nhl_check = 0.0
+    etat = _load(ETAT, {})
 
     while True:
         s = load_settings()
@@ -1254,7 +1789,10 @@ async def watcher(app) -> None:
                     if new:
                         seen_uid = max(m["uid"] for m in new)
                         for m in reversed(new):
-                            await say(app.bot, chat_id, f"Nouveau courriel de {m['from']} : {m['subject']}.")
+                            if m.get("categorie") == "pub" and not s.get("annoncer_pubs"):
+                                continue
+                            pre = "Courriel important" if m.get("categorie") == "important" else "Nouveau courriel"
+                            await say(app.bot, chat_id, f"{pre} de {m['from']} : {m['subject']}.")
         except Exception as exc:  # noqa: BLE001
             print(f"Courriel : {exc}", flush=True)
 
@@ -1270,6 +1808,56 @@ async def watcher(app) -> None:
                     last_morning = now.date()  # trop tard pour aujourd'hui
         except Exception as exc:  # noqa: BLE001
             print(f"Résumé du matin : {exc}", flush=True)
+
+        aujourd = now.date().isoformat()
+
+        def a_l_heure(cle: str, defaut: str) -> bool:
+            """Vrai une seule fois par jour, dans la demi-heure qui suit l'heure réglée."""
+            hm = s.get(cle, defaut)
+            if not re.fullmatch(r"\d{1,2}:\d{2}", hm or "") or etat.get(cle) == aujourd:
+                return False
+            h, m = map(int, hm.split(":"))
+            cible = now.replace(hour=h, minute=m, second=0, microsecond=0)
+            if cible <= now < cible + timedelta(minutes=30):
+                etat[cle] = aujourd
+                _save(ETAT, etat)
+                return True
+            return False
+
+        try:  # résumé du soir
+            if a_l_heure("soir", "21:00"):
+                await say(app.bot, chat_id, await recap_text(await collect_overview(s), soir=True))
+        except Exception as exc:  # noqa: BLE001
+            print(f"Résumé du soir : {exc}", flush=True)
+
+        try:  # alertes météo pour demain
+            if s.get("lat") and a_l_heure("heure_alertes", "18:00"):
+                alertes = alertes_meteo(await asyncio.to_thread(weather_data, s), 1)
+                if alertes:
+                    await say(app.bot, chat_id, "Alerte météo : " + " ".join(alertes))
+        except Exception as exc:  # noqa: BLE001
+            print(f"Alertes météo : {exc}", flush=True)
+
+        try:  # anniversaires (le jour même, à 9 h)
+            if a_l_heure("heure_anniv", "09:00"):
+                for a in anniversaires_proches(0):
+                    await say(app.bot, chat_id, f"🎂 C'est l'anniversaire de {a['nom']} aujourd'hui ! "
+                                                "Pense à lui souhaiter.")
+        except Exception as exc:  # noqa: BLE001
+            print(f"Anniversaires : {exc}", flush=True)
+
+        try:  # résultat du Canadien dès la fin du match
+            if s.get("equipe", "MTL") and time.time() - last_nhl_check > 600:
+                last_nhl_check = time.time()
+                info = await asyncio.to_thread(nhl_info, s.get("equipe", "MTL"))
+                d = info.get("dernier")
+                if d and d["id"] != etat.get("nhl_annonce"):
+                    if etat.get("nhl_annonce") is not None and now - d["debut"] < timedelta(hours=12):
+                        await say(app.bot, chat_id, "🏒 " + nhl_phrase(d, "dernier"))
+                    etat["nhl_annonce"] = d["id"]
+                    _save(ETAT, etat)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Canadiens : {exc}", flush=True)
 
         await asyncio.sleep(60)
 
@@ -1352,7 +1940,14 @@ function mode(m, txt) { orbe.className = m; etat.textContent = txt; }
 function ajoute(texte, classe) { const d = document.createElement('div'); d.className = 'bulle ' + (classe || '');
   d.textContent = texte; fil.appendChild(d); fil.scrollTop = fil.scrollHeight; }
 
+function bip(f1, f2) { try { const c = new AudioContext(), o = c.createOscillator(), g = c.createGain();
+  o.frequency.setValueAtTime(f1, c.currentTime); o.frequency.linearRampToValueAtTime(f2, c.currentTime + .12);
+  g.gain.setValueAtTime(.12, c.currentTime); g.gain.exponentialRampToValueAtTime(.001, c.currentTime + .18);
+  o.connect(g).connect(c.destination); o.start(); o.stop(c.currentTime + .2); } catch (e) {} }
+function stopPC() { fetch('/stop', { method: 'POST', headers: { 'X-Jarvis': '1' } }).catch(() => {}); }
+
 async function demarrer() {
+  stopPC(); bip(520, 880);
   try {
     flux = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
   } catch (e) { ajoute("Je n'ai pas accès au micro. Autorise-le dans le navigateur (icône 🔒 ou 🎤 dans la barre d'adresse).", 'erreur'); return; }
@@ -1362,6 +1957,7 @@ async function demarrer() {
   ecouter();
 }
 function arreter() {
+  stopPC(); bip(880, 440);
   actif = false; if (enregistreur && enregistreur.state !== 'inactive') enregistreur.stop();
   if (flux) flux.getTracks().forEach(t => t.stop()); if (ctx) ctx.close(); flux = ctx = null;
   lecteur.pause(); speechSynthesis.cancel(); mode('arret', 'en pause');
@@ -1391,7 +1987,7 @@ async function ecouter() {
     const seuil = Math.max(0.012, fond * 3);
     niveau.style.opacity = Math.min(1, v / (seuil * 3)); niveau.style.transform = `scale(${1 + Math.min(.25, v * 3)})`;
     if (v > seuil) { if (!parle) { parle = true; debut = t; } dernierSon = t; }
-    if (parle && t - dernierSon > 1300 && t - debut > 400) return enregistreur.stop();   // fin de phrase
+    if (parle && t - dernierSon > 1300 && t - debut > 400) { bip(700, 500); return enregistreur.stop(); }   // fin de phrase
     if (parle && t - debut > 30000) return enregistreur.stop();                          // 30 s max
     if (!parle && t - t0 > 15000) return enregistreur.stop();                            // relance l'écoute
     requestAnimationFrame(boucle);
@@ -1506,8 +2102,12 @@ def build_web_app():
         return web.json_response({"reponse": texte, "audio": await tts_base64(texte)})
 
     app = web.Application(middlewares=[securite], client_max_size=20 * 1024 * 1024)
+    async def stop(request):
+        stop_pc_voice()
+        return web.json_response({"ok": True})
+
     app.add_routes([web.get("/", index), web.post("/parler", parler), web.post("/ecrire", ecrire),
-                    web.post("/recap", recap)])
+                    web.post("/recap", recap), web.post("/stop", stop)])
     return app
 
 
@@ -1564,6 +2164,16 @@ def main() -> None:
     async def post_init(app) -> None:
         tasks.append(asyncio.create_task(watcher(app)))
         await start_web()
+        if load_settings().get("pc_voice") and load_settings().get("son_demarrage", True):
+            async def bonjour():
+                try:
+                    await speak_on_pc("<carillon>", wait=True)
+                    salut = "Jarvis en ligne. Tous les systèmes sont opérationnels" + (
+                        ", Monsieur." if load_settings().get("majordome") else ".")
+                    await speak_on_pc(salut, wait=True)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"Son de démarrage : {exc}", flush=True)
+            tasks.append(asyncio.create_task(bonjour()))
 
     try:
         app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
@@ -1572,6 +2182,13 @@ def main() -> None:
         app.add_handler(CommandHandler("agenda", cmd_agenda))
         app.add_handler(CommandHandler("rappels", cmd_rappels))
         app.add_handler(CommandHandler("recap", cmd_recap))
+        app.add_handler(CommandHandler(["memoire", "memo"], cmd_memoire))
+        app.add_handler(CommandHandler("oublie", cmd_oublie))
+        app.add_handler(CommandHandler(["liste", "listes"], cmd_liste))
+        app.add_handler(CommandHandler(["epicerie", "courses"], cmd_epicerie))
+        app.add_handler(CommandHandler(["taches", "todo"], cmd_taches))
+        app.add_handler(CommandHandler(["stop", "chut"], cmd_stop))
+        app.add_handler(CommandHandler(["canadiens", "ch", "hockey"], cmd_canadiens))
         app.add_handler(CommandHandler("effacer", cmd_effacer))
         app.add_handler(CommandHandler("meteo", cmd_meteo))
         app.add_handler(CommandHandler("nouvelles", cmd_nouvelles))
@@ -1597,5 +2214,7 @@ if __name__ == "__main__":
         choisir_voix()
     elif len(sys.argv) > 1 and sys.argv[1] in ("diagnostic", "diag", "test"):
         diagnostic()
+    elif len(sys.argv) > 1 and sys.argv[1] in ("modele", "modèle", "ia"):
+        choisir_modele()
     else:
         main()

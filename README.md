@@ -54,6 +54,11 @@ Il lit tes courriels, connaît ton agenda, te rappelle tes rendez-vous et te fai
 5. Démarrage automatique avec Windows : `./demarrage-auto.sh` (retirer : `./demarrage-auto.sh retirer`).
 
 ### Utilisation
+- **Mémoire** : « Souviens-toi que … », « Oublie ce que je t'ai dit sur … », « Qu'est-ce que tu sais sur moi ? » (`/memoire`). Les anniversaires dictés (« l'anniversaire de Julie est le 21 novembre ») sont rappelés le jour même.
+- **Listes** : « Ajoute du lait et des œufs à l'épicerie », « J'ai acheté le lait », « Qu'est-ce qu'il y a sur ma liste ? », « Ajoute appeler le garage à mes tâches » (`/liste`, `/epicerie`, `/taches`).
+- **Automatique** : tri des courriels (pubs ignorées), alertes météo la veille (neige, grand froid, verglas, vent), résumé du soir, résultat du Canadien dès la fin du match (`/canadiens`).
+- **Stop** : « Stop » / « Tais-toi » / `/stop`, ou cliquer sur le cercle, coupe la voix sur l'ordi.
+- **IA selon la carte graphique** : `~/.jarvis-voix/bin/python ~/jarvis_voix.py modele` — **Diagnostic** : `… jarvis_voix.py diagnostic`.
 - **Sur l'ordinateur, avec le micro** : ouvre http://localhost:8765 dans Edge ou Chrome, clique sur le cercle et parle (il répond à voix haute et réécoute). Astuce : dans Edge, menu ⋯ → Applications → « Installer ce site en tant qu'application » pour avoir une icône Jarvis.
 - Vocal 🎤 (bouton micro de Telegram) ou texte : « Qu'est-ce que j'ai demain ? », « Lis-moi mes courriels »…
 - Commandes : `/recap`, `/agenda`, `/courriels`, `/meteo`, `/nouvelles`, `/cherche …`, `/rappels`, `/aide`.
