@@ -54,6 +54,7 @@ Il lit tes courriels, connaît ton agenda, te rappelle tes rendez-vous et te fai
 5. Démarrage automatique avec Windows : `./demarrage-auto.sh` (retirer : `./demarrage-auto.sh retirer`).
 
 ### Utilisation
+- **Google Agenda en écriture** (après `~/.jarvis-voix/bin/python ~/jarvis_voix.py google`) : « Ajoute dentiste mardi à 14 h à mon agenda », « Mets dans mon agenda : souper avec Julie vendredi de 18 h à 21 h », « Prends-moi un rendez-vous chez le coiffeur jeudi à 16 h pendant une heure », « Déplace le dentiste à jeudi », « Annule mon rendez-vous chez le dentiste ». Toujours confirmé avant d'écrire. L'agenda est aussi lu en temps réel (plus de délai de l'adresse iCal).
 - **Répondre aux courriels** : « Réponds à Amélie que je serai là samedi », ou « Réponds à Amélie » (il résume et demande quoi répondre), ou « Écris un courriel à nom@exemple.com pour dire que … ». Il lit le brouillon et n'envoie qu'après « oui » (boutons ✅/❌ sur Telegram). Envoi par Gmail (même mot de passe d'application).
 - **Contrôler le PC** : « Ouvre Spotify / YouTube / la calculatrice », « Mets Céline Dion sur YouTube », « Mets de la musique », « Pause », « Chanson suivante », « Monte le son », « Volume à 30 », « Verrouille l'ordi », « Éteins l'ordi » (à confirmer, « annule l'arrêt »), « Mets un minuteur de 10 minutes ».
 - **Trajets** (OpenStreetMap, sans trafic) : « Combien de temps pour aller au Costco de Laval ? » ; avant un rendez-vous avec un lieu, « il est temps de partir ». Adresse de départ dans les réglages.

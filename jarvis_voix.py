@@ -17,6 +17,7 @@ Usage :
     python jarvis_voix.py voix       # écouter et choisir la voix de Jarvis
     python jarvis_voix.py modele     # choisir la meilleure IA selon la carte graphique
     python jarvis_voix.py accelerer  # reconnaissance vocale sur la carte graphique (NVIDIA)
+    python jarvis_voix.py google     # autoriser Jarvis à modifier ton Google Agenda
     python jarvis_voix.py diagnostic # tout tester
 
 Parle directement à Ollama (le moteur d'IA local installé avec OpenJarvis).
@@ -139,6 +140,14 @@ def diagnostic() -> None:
         ok("Son joué sur l'ordinateur — tu l'as entendu ? Sinon vérifie le volume et la sortie audio de Windows.")
     except Exception as exc:  # noqa: BLE001
         ko(f"Son sur l'ordinateur impossible : {exc}")
+    if google_connecte():
+        try:
+            n = len(google_evenements(7))
+            ok(f"Google Agenda connecté (lecture et écriture) : {n} rendez-vous cette semaine")
+        except Exception as exc:  # noqa: BLE001
+            ko(f"Google Agenda : {exc}")
+    else:
+        print("  … Google Agenda : lecture seule (pour écrire : jarvis_voix.py google)", flush=True)
     ok("« Hey Jarvis » installé") if charger_mot_reveil() else ko(
         "« Hey Jarvis » absent : ~/.local/bin/uv pip install --python ~/.jarvis-voix/bin/python openwakeword==0.4.0")
     print("  … reconnaissance vocale :", "carte graphique" if s.get("whisper_gpu") else
@@ -541,6 +550,8 @@ def _calendar(s: dict, use_cache: bool = True):
 
 
 def fetch_events(s: dict, days: int = 7, use_cache: bool = True) -> list[dict]:
+    if google_connecte():
+        return google_evenements(days)
     import recurring_ical_events
 
     now = datetime.now().astimezone()
@@ -1170,6 +1181,7 @@ async def creer_brouillon(m, ecrire: bool) -> str:
     sujet = (("Re: " + re.sub(r"^\s*(re|tr|fwd?)\s*:\s*", "", original["subject"], flags=re.I))
              if original and not ecrire else (consigne[:60].capitalize() if ecrire else "Message"))
     _brouillon.clear()
+    _agenda_attente.clear()
     _brouillon.update(a=a, nom=nom, sujet=sujet, corps=corps, consigne=consigne, original=original if not ecrire else None,
                       expire=time.time() + 600, nouveau=True)
     return f"Voici le brouillon pour {nom} :\n\n{corps}\n\nJe l'envoie ? Dites oui, non, ou ce qu'il faut changer."
@@ -1423,6 +1435,314 @@ async def repondre_trajet(q: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Google Agenda : lire en temps réel, ajouter, déplacer, supprimer (avec confirmation)
+# ---------------------------------------------------------------------------
+
+GOOGLE_CLIENT = HOME / "google_client.json"
+GOOGLE_TOKEN = HOME / "google_token.json"
+GOOGLE_PORT = 8790
+GCAL = "https://www.googleapis.com/calendar/v3/calendars/primary/events"
+_gtok: dict = {}
+
+
+def google_connecte() -> bool:
+    return GOOGLE_TOKEN.exists() and GOOGLE_CLIENT.exists()
+
+
+def _client_google() -> dict:
+    d = json.loads(GOOGLE_CLIENT.read_text())
+    return d.get("installed") or d.get("web") or d
+
+
+def google_jeton() -> str:
+    """Jeton d'accès valide (rafraîchi automatiquement)."""
+    if _gtok.get("access") and time.time() < _gtok.get("expire", 0) - 60:
+        return _gtok["access"]
+    c, t = _client_google(), json.loads(GOOGLE_TOKEN.read_text())
+    r = httpx.post("https://oauth2.googleapis.com/token", timeout=20, data={
+        "client_id": c["client_id"], "client_secret": c.get("client_secret", ""),
+        "refresh_token": t["refresh_token"], "grant_type": "refresh_token"})
+    if r.status_code in (400, 401):
+        raise RuntimeError("l'autorisation Google a expiré : relance « jarvis_voix.py google »")
+    r.raise_for_status()
+    d = r.json()
+    _gtok.update(access=d["access_token"], expire=time.time() + d.get("expires_in", 3600))
+    return _gtok["access"]
+
+
+def _g(methode: str, url: str, **kw):
+    r = httpx.request(methode, url, headers={"Authorization": f"Bearer {google_jeton()}"}, timeout=20, **kw)
+    r.raise_for_status()
+    return r.json() if r.content else {}
+
+
+def _evt(e: dict) -> dict:
+    st = e.get("start", {})
+    if "dateTime" in st:
+        debut, jour_entier = datetime.fromisoformat(st["dateTime"].replace("Z", "+00:00")).astimezone(), False
+    else:
+        debut, jour_entier = datetime.combine(date.fromisoformat(st["date"]), datetime.min.time()).astimezone(), True
+    fin_raw = e.get("end", {})
+    fin = (datetime.fromisoformat(fin_raw["dateTime"].replace("Z", "+00:00")).astimezone() if "dateTime" in fin_raw
+           else debut + timedelta(days=1))
+    return {"uid": e.get("id", ""), "id": e.get("id", ""), "title": e.get("summary", "(sans titre)"),
+            "where": e.get("location", "") or "", "start": debut, "end": fin, "all_day": jour_entier}
+
+
+def google_evenements(days: int = 7, q: str = "", debut: datetime | None = None) -> list[dict]:
+    now = datetime.now().astimezone()
+    t0 = debut or now.replace(hour=0, minute=0, second=0, microsecond=0)
+    params = {"timeMin": t0.isoformat(), "timeMax": (t0 + timedelta(days=days + 1)).isoformat(),
+              "singleEvents": "true", "orderBy": "startTime", "maxResults": 100}
+    if q:
+        params["q"] = q
+    return [_evt(e) for e in _g("GET", GCAL, params=params).get("items", []) if e.get("status") != "cancelled"]
+
+
+def google_ajouter(titre: str, debut: datetime, fin: datetime | None, lieu: str = "", jour_entier: bool = False) -> dict:
+    corps = {"summary": titre}
+    if lieu:
+        corps["location"] = lieu
+    if jour_entier:
+        corps.update(start={"date": debut.date().isoformat()}, end={"date": (debut.date() + timedelta(days=1)).isoformat()})
+    else:
+        corps.update(start={"dateTime": debut.isoformat()}, end={"dateTime": (fin or debut + timedelta(hours=1)).isoformat()})
+    _ics_cache["cal"] = None
+    return _evt(_g("POST", GCAL, json=corps))
+
+
+def google_deplacer(e: dict, debut: datetime) -> dict:
+    duree = e["end"] - e["start"]
+    _ics_cache["cal"] = None
+    return _evt(_g("PATCH", f"{GCAL}/{e['id']}", json={"start": {"dateTime": debut.isoformat()},
+                                                        "end": {"dateTime": (debut + duree).isoformat()}}))
+
+
+def google_supprimer(e: dict) -> None:
+    _ics_cache["cal"] = None
+    _g("DELETE", f"{GCAL}/{e['id']}")
+
+
+def connecter_google() -> None:
+    """Autorise Jarvis à lire et modifier ton Google Agenda (une seule fois)."""
+    import base64
+    import glob
+    import hashlib
+    import secrets
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from urllib.parse import parse_qs, urlencode, urlparse
+
+    if not GOOGLE_CLIENT.exists():
+        trouves = sorted(glob.glob("/mnt/c/Users/*/Downloads/client_secret*.json")
+                         + glob.glob("/mnt/c/Users/*/OneDrive/*/client_secret*.json")
+                         + glob.glob(str(Path.home() / "client_secret*.json")), key=os.path.getmtime)
+        if not trouves:
+            print("❌ Je ne trouve pas le fichier client_secret….json dans tes Téléchargements.\n"
+                  "   Télécharge-le depuis la console Google (Clients → ⬇), puis relance cette commande.")
+            return
+        GOOGLE_CLIENT.write_text(Path(trouves[-1]).read_text())
+        os.chmod(GOOGLE_CLIENT, 0o600)
+        print(f"✅ Fichier d'autorisation trouvé : {Path(trouves[-1]).name}")
+    c = _client_google()
+    verif = secrets.token_urlsafe(64)
+    defi = base64.urlsafe_b64encode(hashlib.sha256(verif.encode()).digest()).rstrip(b"=").decode()
+    etat_secret = secrets.token_urlsafe(16)
+    redirect = f"http://localhost:{GOOGLE_PORT}/"
+    url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode({
+        "client_id": c["client_id"], "redirect_uri": redirect, "response_type": "code",
+        "scope": "https://www.googleapis.com/auth/calendar.events", "access_type": "offline", "prompt": "consent",
+        "code_challenge": defi, "code_challenge_method": "S256", "state": etat_secret})
+    recu: dict = {}
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            qs = parse_qs(urlparse(self.path).query)
+            if "code" in qs or "error" in qs:
+                recu.update({k: v[0] for k, v in qs.items()})
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            ok_ = "code" in qs and qs.get("state", [""])[0] == etat_secret
+            self.wfile.write(("<html><body style='font-family:sans-serif;background:#03070f;color:#d8f6ff;text-align:center;"
+                              "padding-top:80px'><h1>" + ("✅ C'est bon !" if ok_ else "❌ Autorisation refusée") +
+                              "</h1><p>Tu peux fermer cette page et retourner à Jarvis.</p></body></html>").encode())
+
+        def log_message(self, *a):
+            pass
+
+    serveur = HTTPServer(("127.0.0.1", GOOGLE_PORT), H)
+    threading.Thread(target=lambda: [serveur.handle_request() for _ in range(5) if not recu], daemon=True).start()
+    print("\nJe t'ouvre la page Google dans ton navigateur…")
+    print("  • Choisis ton compte Google.")
+    print("  • Si Google dit « Google n'a pas validé cette application » : clique « Paramètres avancés »,")
+    print("    puis « Accéder à Jarvis (non sécurisé) ». C'est normal : c'est ta propre application.")
+    print("  • Coche l'accès à l'agenda et clique « Continuer ».\n")
+    try:
+        powershell(f"Start-Process {_ps_str(url)}")
+    except Exception:  # noqa: BLE001
+        pass
+    print("Si rien ne s'ouvre, copie cette adresse dans ton navigateur :\n" + url + "\n")
+    debut_attente = time.time()
+    while not recu and time.time() - debut_attente < 600:
+        time.sleep(0.5)
+    serveur.server_close()
+    if recu.get("state") != etat_secret or "code" not in recu:
+        print(f"❌ Autorisation non reçue ({recu.get('error', 'délai dépassé')}). Relance la commande pour réessayer.")
+        return
+    r = httpx.post("https://oauth2.googleapis.com/token", timeout=20, data={
+        "client_id": c["client_id"], "client_secret": c.get("client_secret", ""), "code": recu["code"],
+        "code_verifier": verif, "grant_type": "authorization_code", "redirect_uri": redirect})
+    if r.status_code != 200 or "refresh_token" not in r.json():
+        print(f"❌ Google a refusé l'échange : {r.text[:300]}")
+        return
+    GOOGLE_TOKEN.write_text(json.dumps({"refresh_token": r.json()["refresh_token"]}))
+    os.chmod(GOOGLE_TOKEN, 0o600)
+    print("✅ Google Agenda connecté !\n\nTes prochains rendez-vous :")
+    try:
+        for e in google_evenements(7)[:6]:
+            print(f"   - {describe_event(e)}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"   (lecture impossible : {exc})")
+    print("\nRedémarre Jarvis :  pkill -f jarvis_voix.py")
+
+
+# --- Phrases pour l'agenda ---
+
+AG_AJOUT = re.compile(
+    r"^\s*(?:jarvis\W+)?(?:(?:peux-tu|tu peux)\s+)?(?:"
+    r"(?:ajoute|rajoute|mets|inscris|note|planifie|programme|crée|cree|prévois|prevois)\s+(?P<a>.+?)\s+(?:à|a|dans|sur)\s+"
+    r"(?:mon|l['’]|le|mon\s+google)\s*(?:agenda|calendrier)"
+    r"|(?:ajoute|mets|inscris|note)\s+(?:à|a|dans|sur)\s+(?:mon|l['’])\s*(?:agenda|calendrier)\s*:?\s*(?P<b>.+?)"
+    r"|(?:ajoute|rajoute|mets|prends|prends-moi|planifie|crée|cree|prévois|prevois|booke|réserve|reserve)\s+(?:moi\s+)?(?:un\s+|une\s+)?"
+    r"(?P<c>(?:rendez-vous|rdv|rencontre|réunion|reunion)\b.+?))\s*[.!?]*$", re.I)
+AG_DEPLACE = re.compile(r"^\s*(?:jarvis\W+)?(?:déplace|deplace|reporte|décale|decale|change l.heure d[eu]|bouge)\s+"
+                        r"(?:mon\s+|le\s+|la\s+|ma\s+)?(?:rendez-vous|rdv|rencontre|réunion|reunion)?\s*(?:de|du|d['’]|avec|chez)?\s*"
+                        r"(?P<quoi>.+?)\s+(?:à|au|a|pour|vers|jusqu.à)\s+(?P<quand>.+?)\s*[.!?]*$", re.I)
+AG_SUPPRIME = re.compile(r"^\s*(?:jarvis\W+)?(?:annule|supprime|efface|enlève|enleve|retire)\s+(?:mon\s+|le\s+|la\s+|ma\s+)?"
+                         r"(?:(?:rendez-vous|rdv|rencontre|réunion|reunion|événement|evenement)\s*(?:de|du|d['’]|avec|chez)?\s*"
+                         r"(?P<quoi>.+?)|(?P<quoi2>.+?)\s+(?:de|dans)\s+(?:mon|l['’])\s*(?:agenda|calendrier))\s*[.!?]*$", re.I)
+_agenda_attente: dict = {}
+
+
+def _a_une_heure(t: str) -> bool:
+    return bool(re.search(r"\b\d{1,2}\s*(?:h|heures?|:)|\bmidi\b|\bminuit\b|\bdans\s+\S+\s+(?:minutes?|heures?)", t, re.I))
+
+
+def _interpreter_ajout(texte: str):
+    """« dentiste mardi à 14 h » → (titre, début, fin, lieu, jour_entier) ou None."""
+    fin_heure = None
+    if m := re.search(r"\bde\s+(\d{1,2})\s*h\s*(\d{2})?\s+(?:à|a|jusqu.à)\s+(\d{1,2})\s*h\s*(\d{2})?", texte, re.I):
+        fin_heure = (int(m.group(3)), int(m.group(4) or 0))
+        texte = texte[:m.start()] + f" à {m.group(1)}h{m.group(2) or ''} " + texte[m.end():]
+    duree = None
+    if m := re.search(r"\bpendant\s+(\d+|une?|deux|trois)\s*(heures?|h|minutes?|min)\b(?:\s+et\s+demie)?", texte, re.I):
+        n = _num(m.group(1))
+        duree = timedelta(hours=n) if m.group(2).lower().startswith("h") else timedelta(minutes=n)
+        if "demie" in m.group(0).lower():
+            duree += timedelta(minutes=30)
+        texte = texte[:m.start()] + texte[m.end():]
+    lieu = ""
+    if m := re.search(r"\b(?:au|à l['’]adresse|lieu\s*:?)\s+(\d+[^,]*(?:,\s*[\w' -]+)?)\s*$", texte, re.I):
+        lieu, texte = m.group(1).strip(), texte[:m.start()]
+    jour_entier = not _a_une_heure(texte)
+    parsed = parse_rappel(texte)
+    if not parsed:
+        return None
+    debut, quoi = parsed
+    quoi = re.sub(r"^(?:un\s+|une\s+)?(?:rendez-vous|rdv)\s*", "Rendez-vous ", quoi, flags=re.I).strip()
+    quoi = re.sub(r"^Rendez-vous\s*$", "Rendez-vous", quoi)
+    titre = (quoi[:1].upper() + quoi[1:]) if quoi and quoi != "ton rappel" else "Rendez-vous"
+    if jour_entier:
+        return titre, debut, None, lieu, True
+    fin = None
+    if fin_heure:
+        fin = debut.replace(hour=fin_heure[0], minute=fin_heure[1])
+    elif duree:
+        fin = debut + duree
+    return titre, debut, fin, lieu, False
+
+
+def _trouver_evenement(quoi: str) -> tuple[dict | None, str]:
+    """Cherche un rendez-vous à venir qui ressemble à « quoi » (et au jour mentionné, s'il y en a un)."""
+    jour = None
+    if re.search(r"\b(aujourd|demain|" + JOURS_RE + r"|\d{1,2}\s+(?:" + MOIS_RE + r"))", quoi, re.I):
+        p = parse_rappel(quoi)
+        if p:
+            jour, quoi = p[0].date(), p[1]
+    mots = [w for w in re.findall(r"\w+", _sans_accents(quoi)) if len(w) > 2 and w not in ("les", "des", "une", "mon", "rendez", "vous")]
+    evs = google_evenements(60, debut=datetime.now().astimezone())
+    for e in evs:
+        if jour and e["start"].date() != jour:
+            continue
+        if not mots or all(w in _sans_accents(e["title"] + " " + e["where"]) for w in mots):
+            return e, quoi
+    return None, quoi
+
+
+async def gerer_agenda(q: str) -> str | None:
+    # Confirmation en attente
+    if _agenda_attente and time.time() < _agenda_attente.get("expire", 0):
+        if OUI.match(q):
+            a = dict(_agenda_attente)
+            _agenda_attente.clear()
+            try:
+                if a["action"] == "ajout":
+                    e = await asyncio.to_thread(google_ajouter, a["titre"], a["debut"], a["fin"], a["lieu"], a["jour_entier"])
+                    return f"C'est ajouté à votre agenda : {describe_event(e)}."
+                if a["action"] == "deplace":
+                    e = await asyncio.to_thread(google_deplacer, a["evt"], a["debut"])
+                    return f"C'est déplacé : {describe_event(e)}."
+                await asyncio.to_thread(google_supprimer, a["evt"])
+                return f"C'est supprimé : {a['evt']['title']}."
+            except Exception as exc:  # noqa: BLE001
+                return f"Google Agenda a refusé : {exc}"
+        if NON.match(q):
+            _agenda_attente.clear()
+            return "D'accord, je ne touche pas à l'agenda."
+    m_aj, m_dep, m_sup = AG_AJOUT.match(q), AG_DEPLACE.match(q), AG_SUPPRIME.match(q)
+    if not (m_aj or m_dep or m_sup):
+        return None
+    if not google_connecte():
+        return ("Pour modifier votre agenda, il faut d'abord connecter Google : lancez « jarvis_voix.py google » "
+                "dans Ubuntu.")
+    _brouillon.clear()
+    _agenda_attente.clear()
+    try:
+        if m_aj:
+            texte = m_aj.group("a") or m_aj.group("b") or m_aj.group("c")
+            r = _interpreter_ajout(texte)
+            if not r:
+                return "Pour quand ? Dites par exemple : ajoute dentiste mardi à 14 h à mon agenda."
+            titre, debut, fin, lieu, jour_entier = r
+            _agenda_attente.update(action="ajout", titre=titre, debut=debut, fin=fin, lieu=lieu, jour_entier=jour_entier,
+                                   expire=time.time() + 300, nouveau=True)
+            quand = f"{fmt_day(debut.date())}, toute la journée" if jour_entier else fmt_when(debut) + (
+                f" jusqu'à {fmt_hour(fin)}" if fin else "")
+            return f"J'ajoute « {titre} » {quand}{', ' + lieu if lieu else ''} à votre agenda ?"
+        if m_dep:
+            e, _ = await asyncio.to_thread(_trouver_evenement, m_dep.group("quoi"))
+            if not e:
+                return f"Je ne trouve pas de rendez-vous « {m_dep.group('quoi')} » dans les 60 prochains jours."
+            p = parse_rappel(m_dep.group("quand"))
+            if not p:
+                return "Pour quand voulez-vous le déplacer ?"
+            debut = p[0]
+            if not _a_une_heure(m_dep.group("quand")) and not e["all_day"]:
+                debut = debut.replace(hour=e["start"].hour, minute=e["start"].minute)
+            _agenda_attente.update(action="deplace", evt=e, debut=debut, expire=time.time() + 300, nouveau=True)
+            return f"Je déplace « {e['title']} », prévu {fmt_when(e['start'])}, à {fmt_when(debut)} ?"
+        quoi = m_sup.group("quoi") or m_sup.group("quoi2")
+        e, _ = await asyncio.to_thread(_trouver_evenement, quoi)
+        if not e:
+            return f"Je ne trouve pas de rendez-vous « {quoi} » dans les 60 prochains jours."
+        _agenda_attente.update(action="supprime", evt=e, expire=time.time() + 300, nouveau=True)
+        return f"Je supprime « {e['title']} », prévu {fmt_when(e['start'])} ?"
+    except Exception as exc:  # noqa: BLE001
+        return f"Google Agenda ne répond pas : {exc}"
+
+
+# ---------------------------------------------------------------------------
 # Jarvis (IA locale via Ollama)
 # ---------------------------------------------------------------------------
 
@@ -1445,6 +1765,7 @@ def system_prompt(extra: str = "") -> str:
         "utile, ces informations te sont fournies dans son message. Ne dis jamais que tu n'y as pas "
         "accès. Tu peux aussi créer des rappels (« rappelle-moi … »), retenir des choses (« souviens-toi que … ») "
         "et gérer des listes (« ajoute du lait à l'épicerie »), répondre à ses courriels (« réponds à Amélie que … »), "
+        "ajouter, déplacer ou annuler des rendez-vous (« ajoute dentiste mardi à 14 h à mon agenda »), "
         "ouvrir des applis et régler le son de l'ordinateur, et calculer des temps de trajet. "
         f"Nous sommes {JOURS[now.weekday()]} {now.day} {MOIS[now.month - 1]} {now.year}, "
         f"il est {fmt_hour(now)}."
@@ -1951,13 +2272,18 @@ async def on_message(update, context) -> None:
         await msg.reply_text(f"L'IA ne répond pas ({exc}). Est-ce qu'Ollama tourne ?")
         return
     await say(context.bot, chat_id, answer, reply_to=msg)
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
     if _brouillon.get("nouveau"):
         _brouillon["nouveau"] = False
-        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-
         await context.bot.send_message(chat_id, "Que fait-on de ce courriel ?", reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ Envoyer", callback_data="brouillon:oui"),
             InlineKeyboardButton("❌ Annuler", callback_data="brouillon:non")]]))
+    if _agenda_attente.get("nouveau"):
+        _agenda_attente["nouveau"] = False
+        await context.bot.send_message(chat_id, "On le fait ?", reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Oui", callback_data="agenda:oui"),
+            InlineKeyboardButton("❌ Non", callback_data="agenda:non")]]))
 
 
 async def on_bouton(update, context) -> None:
@@ -1966,8 +2292,12 @@ async def on_bouton(update, context) -> None:
         await q.answer()
         return
     await q.answer()
-    r = await gerer_brouillon("oui" if q.data == "brouillon:oui" else "non") if _brouillon else "Ce brouillon a expiré."
-    await q.edit_message_text(r or "Ce brouillon a expiré.")
+    rep_ = "oui" if q.data.endswith(":oui") else "non"
+    if q.data.startswith("agenda:"):
+        r = await gerer_agenda(rep_) if _agenda_attente else None
+    else:
+        r = await gerer_brouillon(rep_) if _brouillon else None
+    await q.edit_message_text(r or "Cette demande a expiré.")
 
 
 def conversation_id() -> int:
@@ -1986,7 +2316,12 @@ async def intention(question: str) -> str | None:
     if MOTS_STOP.match(question):
         stop_pc_voice()
         return "D'accord."
+    if _agenda_attente and (OUI.match(question) or NON.match(question)):
+        if (r := await gerer_agenda(question)) is not None:
+            return r
     if (r := await gerer_brouillon(question)) is not None:
+        return r
+    if (r := await gerer_agenda(question)) is not None:
         return r
     if (m := REPONDRE.match(question)) and not re.fullmatch(r"(ma|mon|mes|la|le|les|à|a)", m.group("qui").strip(), re.I):
         return await creer_brouillon(m, ecrire=False)
@@ -2243,6 +2578,8 @@ async def cmd_aide(update, context) -> None:
         "• /canadiens — résultats et prochain match\n"
         "• /stop — me faire taire sur l'ordi\n\n"
         "Je peux aussi : répondre à tes courriels (« Réponds à Amélie que … » ou juste « Réponds à Amélie »), "
+        "gérer ton agenda (« Ajoute dentiste mardi à 14 h à mon agenda », « Déplace le dentiste à jeudi », "
+        "« Annule mon rendez-vous chez le dentiste »), "
         "ouvrir des applis (« Ouvre Spotify »), mettre de la musique, régler le son, verrouiller l'ordi, "
         "lancer un minuteur et calculer un trajet (« Combien de temps pour aller à Laval ? »).\n\n"
         "Exemples : « Qu'est-ce que j'ai demain ? », « Lis-moi mes courriels », "
@@ -3082,7 +3419,7 @@ def main() -> None:
         app.add_handler(CommandHandler("recap", cmd_recap))
         from telegram.ext import CallbackQueryHandler
 
-        app.add_handler(CallbackQueryHandler(on_bouton, pattern=r"^brouillon:"))
+        app.add_handler(CallbackQueryHandler(on_bouton, pattern=r"^(brouillon|agenda):"))
         app.add_handler(CommandHandler(["memoire", "memo"], cmd_memoire))
         app.add_handler(CommandHandler("oublie", cmd_oublie))
         app.add_handler(CommandHandler(["liste", "listes"], cmd_liste))
@@ -3119,5 +3456,7 @@ if __name__ == "__main__":
         choisir_modele()
     elif len(sys.argv) > 1 and sys.argv[1] in ("accelerer", "accélérer"):
         accelerer()
+    elif len(sys.argv) > 1 and sys.argv[1] == "google":
+        connecter_google()
     else:
         main()
