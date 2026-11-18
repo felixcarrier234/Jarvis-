@@ -10,6 +10,7 @@ Usage :
     python jarvis_voix.py            # lance l'assistant
     python jarvis_voix.py reglages   # configure courriel / agenda / rappels
 
+Parle directement à Ollama (le moteur d'IA local installé avec OpenJarvis).
 Lit le token Telegram, ton Id et le modèle dans ~/.openjarvis/config.toml,
 et les réglages de l'assistant dans ~/.openjarvis/assistant.json.
 """
@@ -40,7 +41,9 @@ import httpx
 HOME = Path(os.environ.get("OPENJARVIS_HOME", Path.home() / ".openjarvis"))
 CONFIG = HOME / "config.toml"
 SETTINGS = HOME / "assistant.json"
-API = "http://127.0.0.1:8000"
+OLLAMA = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
+if not OLLAMA.startswith("http"):
+    OLLAMA = "http://" + OLLAMA
 VOICE = os.environ.get("JARVIS_VOIX", "fr-FR-HenriNeural")
 WHISPER_MODEL = os.environ.get("JARVIS_WHISPER", "small")
 
@@ -303,7 +306,7 @@ def events_text(evs: list[dict]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Jarvis (LLM via jarvis serve)
+# Jarvis (IA locale via Ollama)
 # ---------------------------------------------------------------------------
 
 cfg = tomllib.loads(CONFIG.read_text())
@@ -321,14 +324,13 @@ def system_prompt(extra: str = "") -> str:
         "Tu es Jarvis, l'assistant personnel de l'utilisateur. Tu réponds toujours en français, "
         "de façon naturelle, chaleureuse et assez courte (2 à 5 phrases), car ta réponse sera lue "
         "à voix haute. N'utilise pas de listes, d'emojis ni de mise en forme. "
+        "Tu as accès à l'agenda et aux courriels de l'utilisateur : quand c'est utile, ils te sont "
+        "fournis dans son message. Ne dis jamais que tu n'as pas accès à ses comptes. "
         f"Nous sommes {JOURS[now.weekday()]} {now.day} {MOIS[now.month - 1]} {now.year}, "
         f"il est {fmt_hour(now)}."
     )
     if extra:
-        base += (
-            "\n\nVoici des informations RÉELLES sur l'utilisateur. Utilise-les pour répondre, "
-            "n'invente jamais de courriel ni de rendez-vous qui n'est pas dans cette liste.\n" + extra
-        )
+        base += "\n\n" + extra
     return base
 
 
@@ -338,14 +340,41 @@ def clean(text: str) -> str:
     return text.strip()
 
 
+_model_cache: dict = {}
+
+
+async def pick_model(client: httpx.AsyncClient) -> str:
+    """Le modèle de la config s'il est installé, sinon le premier disponible."""
+    if "name" in _model_cache:
+        return _model_cache["name"]
+    r = await client.get(f"{OLLAMA}/api/tags")
+    r.raise_for_status()
+    names = [m.get("name", "") for m in r.json().get("models", [])]
+    chosen = MODEL
+    if MODEL not in names and f"{MODEL}:latest" not in names:
+        if not names:
+            raise RuntimeError("aucun modèle installé dans Ollama (essaie : ollama pull qwen3.5:2b)")
+        chosen = names[0]
+        print(f"Modèle {MODEL} absent, j'utilise {chosen}.", flush=True)
+    _model_cache["name"] = chosen
+    return chosen
+
+
 async def llm(messages: list[dict]) -> str:
-    async with httpx.AsyncClient(timeout=300) as client:
-        r = await client.post(
-            f"{API}/v1/chat/completions",
-            json={"model": MODEL, "messages": messages, "max_tokens": 700},
-        )
+    async with httpx.AsyncClient(timeout=600) as client:
+        body = {
+            "model": await pick_model(client),
+            "messages": messages,
+            "stream": False,
+            "think": False,
+            "options": {"num_ctx": 8192, "temperature": 0.6},
+        }
+        r = await client.post(f"{OLLAMA}/api/chat", json=body)
+        if r.status_code == 400 and "think" in r.text:
+            body.pop("think")
+            r = await client.post(f"{OLLAMA}/api/chat", json=body)
         r.raise_for_status()
-        return clean(r.json()["choices"][0]["message"]["content"] or "")
+        return clean(r.json().get("message", {}).get("content", "") or "")
 
 
 async def gather_context(question: str, s: dict) -> str:
@@ -369,7 +398,13 @@ async def ask_jarvis(chat_id: int, question: str) -> str:
     s = load_settings()
     extra = await gather_context(question, s)
     h = history[chat_id]
-    messages = [{"role": "system", "content": system_prompt(extra)}, *h, {"role": "user", "content": question}]
+    content = question
+    if extra:
+        content = (
+            "Voici mes vraies données (utilise-les pour me répondre, n'invente rien d'autre) :\n\n"
+            f"{extra}\n\nMa question : {question}"
+        )
+    messages = [{"role": "system", "content": system_prompt()}, *h, {"role": "user", "content": content}]
     answer = await llm(messages) or "Désolé, je n'ai pas de réponse."
     h.append({"role": "user", "content": question})
     h.append({"role": "assistant", "content": answer})
@@ -455,9 +490,62 @@ async def on_message(update, context) -> None:
     try:
         answer = await ask_jarvis(chat_id, question)
     except Exception as exc:  # noqa: BLE001
-        await msg.reply_text(f"Jarvis ne répond pas ({exc}). Est-ce que 'jarvis serve' tourne ?")
+        await msg.reply_text(f"L'IA ne répond pas ({exc}). Est-ce qu'Ollama tourne ?")
         return
     await say(context.bot, chat_id, answer, reply_to=msg)
+
+
+async def cmd_courriels(update, context) -> None:
+    chat_id = update.effective_chat.id
+    if ALLOWED and str(chat_id) not in ALLOWED:
+        return
+    s = load_settings()
+    if not s.get("email"):
+        await update.effective_message.reply_text("Courriel pas branché : lance « jarvis_voix.py reglages ».")
+        return
+    try:
+        mails = await asyncio.to_thread(fetch_emails, s, 5)
+    except Exception as exc:  # noqa: BLE001
+        await update.effective_message.reply_text(f"Impossible de lire tes courriels : {exc}")
+        return
+    if not mails:
+        await say(context.bot, chat_id, "Ta boîte de réception est vide.")
+        return
+    lignes = [f"De {m['from']}, {fmt_when(m['date']) if m['date'] else ''} : {m['subject']}." for m in mails]
+    nonlus = sum(m["unread"] for m in mails)
+    await say(context.bot, chat_id, f"Tes {len(mails)} derniers courriels, dont {nonlus} non lus. " + " ".join(lignes))
+
+
+async def cmd_agenda(update, context) -> None:
+    chat_id = update.effective_chat.id
+    if ALLOWED and str(chat_id) not in ALLOWED:
+        return
+    s = load_settings()
+    if not s.get("ics_url"):
+        await update.effective_message.reply_text("Agenda pas branché : lance « jarvis_voix.py reglages ».")
+        return
+    try:
+        evs = await asyncio.to_thread(fetch_events, s, 7, False)
+    except Exception as exc:  # noqa: BLE001
+        await update.effective_message.reply_text(f"Impossible de lire ton agenda : {exc}")
+        return
+    now = datetime.now().astimezone()
+    evs = [e for e in evs if e["all_day"] or e["start"] >= now]
+    if not evs:
+        await say(context.bot, chat_id, "Tu n'as aucun rendez-vous dans les 7 prochains jours.")
+        return
+    await say(context.bot, chat_id, "Tes prochains rendez-vous : " + " ; ".join(describe_event(e) for e in evs[:10]) + ".")
+
+
+async def cmd_aide(update, context) -> None:
+    await update.effective_message.reply_text(
+        "Je suis Jarvis 🤖\n\n"
+        "• Parle-moi en vocal 🎤 ou écris-moi.\n"
+        "• /agenda — tes prochains rendez-vous\n"
+        "• /courriels — tes derniers courriels\n"
+        "• Demande aussi : « Qu'est-ce que j'ai demain ? », « Lis-moi mes courriels »…\n\n"
+        "Je te rappelle tes rendez-vous et t'annonce tes nouveaux courriels tout seul."
+    )
 
 
 async def morning_brief(bot, chat_id: str, s: dict) -> None:
@@ -476,9 +564,10 @@ async def morning_brief(bot, chat_id: str, s: dict) -> None:
         except Exception as exc:  # noqa: BLE001
             extra.append(f"COURRIELS : illisibles ({exc})")
     text = await llm([
-        {"role": "system", "content": system_prompt("\n\n".join(extra))},
-        {"role": "user", "content": "Fais-moi mon résumé du matin : souhaite-moi bonne journée, "
-                                    "dis-moi mes rendez-vous d'aujourd'hui et les courriels importants."},
+        {"role": "system", "content": system_prompt()},
+        {"role": "user", "content": "Voici mes vraies données :\n\n" + "\n\n".join(extra)
+         + "\n\nFais-moi mon résumé du matin : souhaite-moi bonne journée, dis-moi mes "
+           "rendez-vous d'aujourd'hui et les courriels importants."},
     ])
     await say(bot, chat_id, text or "Bonjour ! Je n'ai rien de spécial à te signaler ce matin.")
 
@@ -544,29 +633,31 @@ async def watcher(app) -> None:
         await asyncio.sleep(60)
 
 
-def ensure_jarvis_serve() -> subprocess.Popen | None:
+def ensure_ollama() -> subprocess.Popen | None:
     try:
-        httpx.get(f"{API}/v1/models", timeout=3)
+        httpx.get(f"{OLLAMA}/api/tags", timeout=3)
         return None
     except httpx.HTTPError:
         pass
-    jarvis = shutil.which("jarvis") or str(Path.home() / ".local/bin/jarvis")
-    print("Démarrage de Jarvis (jarvis serve)…", flush=True)
-    log = open(HOME / "jarvis-serve.log", "a")
-    proc = subprocess.Popen([jarvis, "serve"], stdout=log, stderr=subprocess.STDOUT)
-    for _ in range(120):
+    ollama = shutil.which("ollama") or "/usr/local/bin/ollama"
+    if not os.path.exists(ollama):
+        raise SystemExit("Ollama introuvable. Réinstalle OpenJarvis ou Ollama (https://ollama.com).")
+    print("Démarrage d'Ollama…", flush=True)
+    log = open(HOME / "ollama.log", "a")
+    proc = subprocess.Popen([ollama, "serve"], stdout=log, stderr=subprocess.STDOUT)
+    for _ in range(60):
         time.sleep(1)
         try:
-            httpx.get(f"{API}/v1/models", timeout=3)
+            httpx.get(f"{OLLAMA}/api/tags", timeout=3)
             return proc
         except httpx.HTTPError:
             if proc.poll() is not None:
-                raise SystemExit(f"jarvis serve s'est arrêté : voir {HOME / 'jarvis-serve.log'}")
-    raise SystemExit(f"jarvis serve ne démarre pas : voir {HOME / 'jarvis-serve.log'}")
+                break
+    raise SystemExit(f"Ollama ne démarre pas : voir {HOME / 'ollama.log'}")
 
 
 def main() -> None:
-    from telegram.ext import ApplicationBuilder, MessageHandler, filters
+    from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
 
     if not TOKEN:
         raise SystemExit(f"Pas de token Telegram dans {CONFIG} (section [channel.telegram]).")
@@ -577,7 +668,7 @@ def main() -> None:
         print("Astuce : lance « ~/.jarvis-voix/bin/python ~/jarvis_voix.py reglages » "
               "pour brancher ton courriel et ton agenda.\n", flush=True)
 
-    proc = ensure_jarvis_serve()
+    proc = ensure_ollama()
     tasks = []
 
     async def post_init(app) -> None:
@@ -585,6 +676,9 @@ def main() -> None:
 
     try:
         app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
+        app.add_handler(CommandHandler(["start", "aide", "help"], cmd_aide))
+        app.add_handler(CommandHandler(["courriels", "courriel", "mails"], cmd_courriels))
+        app.add_handler(CommandHandler("agenda", cmd_agenda))
         app.add_handler(
             MessageHandler((filters.TEXT & ~filters.COMMAND) | filters.VOICE | filters.AUDIO, on_message)
         )
