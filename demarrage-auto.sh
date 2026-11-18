@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Fait démarrer Jarvis Voix tout seul quand tu ouvres ta session Windows (WSL).
-#   ./demarrage-auto.sh           installe le démarrage automatique
+#   ./demarrage-auto.sh                 installe le démarrage automatique (+ ouvre la fenêtre Jarvis)
+#   ./demarrage-auto.sh --sans-fenetre  pareil, sans ouvrir la fenêtre
 #   ./demarrage-auto.sh retirer   le désinstalle
 set -euo pipefail
 
@@ -52,15 +53,37 @@ done
 SH
 chmod +x "$LANCEUR"
 
-# 2) Raccourci invisible dans le dossier Démarrage de Windows.
+# 2) Raccourci invisible dans le dossier Démarrage de Windows :
+#    lance Jarvis, attend qu'il soit prêt, puis ouvre sa fenêtre (sauf avec --sans-fenetre).
 mkdir -p "$STARTUP"
-printf 'Set s = CreateObject("WScript.Shell")\r\ns.Run "wsl.exe -d %s -- bash -lc ""~/jarvis-demarrage.sh""", 0, False\r\n' \
-  "$WSL_DISTRO_NAME" > "$VBS"
+{
+  printf 'Set s = CreateObject("WScript.Shell")\r\n'
+  printf 's.Run "wsl.exe -d %s -- bash -lc ""~/jarvis-demarrage.sh""", 0, False\r\n' "$WSL_DISTRO_NAME"
+  if [[ " $* " != *" --sans-fenetre "* ]]; then
+    printf '%s\r\n' \
+      'On Error Resume Next' \
+      'For i = 1 To 90' \
+      '  WScript.Sleep 2000' \
+      '  Set h = CreateObject("MSXML2.ServerXMLHTTP.6.0")' \
+      '  h.open "GET", "http://localhost:8765/", False' \
+      '  h.send' \
+      '  If Err.Number = 0 Then' \
+      '    If h.status = 200 Then Exit For' \
+      '  End If' \
+      '  Err.Clear' \
+      'Next' \
+      's.Run "msedge --app=http://localhost:8765", 1, False'
+  fi
+} > "$VBS"
 
 # 3) Le lancer tout de suite (en arrière-plan, sans fenêtre).
 (cd /mnt/c 2>/dev/null; wscript.exe "$(wslpath -w "$VBS")" >/dev/null 2>&1 &) || true
 
 echo "✅ Démarrage automatique installé."
-echo "   Jarvis démarre en arrière-plan (environ 20 secondes)."
+if [[ " $* " == *" --sans-fenetre "* ]]; then
+  echo "   Jarvis démarre en arrière-plan (environ 20 secondes)."
+else
+  echo "   Jarvis démarre en arrière-plan ; sa fenêtre s'ouvrira dès qu'il est prêt (moins d'une minute)."
+fi
 echo "   Raccourci Windows : $VBS"
 echo "   Journal de Jarvis : $LOG"
