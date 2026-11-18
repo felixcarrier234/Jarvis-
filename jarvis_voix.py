@@ -113,6 +113,42 @@ def ask(prompt: str, default: str = "") -> str:
     return val or default
 
 
+def diagnostic() -> None:
+    """Teste chaque maillon et dit clairement ce qui marche ou pas."""
+    s = load_settings()
+    ok = lambda m: print(f"  ✅ {m}", flush=True)  # noqa: E731
+    ko = lambda m: print(f"  ❌ {m}", flush=True)  # noqa: E731
+    print("\n=== Diagnostic de Jarvis ===\n")
+    print(f"  Voix réglée : "
+          f"{s.get('voice', VOICE)} {s.get('voice_rate', '+0%')} {s.get('voice_pitch', '+0Hz')}"
+          f"{' + effet IA' if s.get('voice_effect') else ''}")
+    ok(f"Token Telegram présent") if TOKEN else ko("Pas de token Telegram dans la config")
+    ok("ffmpeg installé") if shutil.which("ffmpeg") else ko("ffmpeg manquant : sudo apt install -y ffmpeg")
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = asyncio.run(synth("Test de la voix.", os.path.join(tmp, "t.mp3"), s))
+            ok(f"Fabrication de la voix (Microsoft Edge TTS) : {os.path.getsize(out)} octets")
+    except Exception as exc:  # noqa: BLE001
+        ko(f"Fabrication de la voix impossible : {type(exc).__name__}: {exc}")
+    print("  … dossier temporaire Windows :", _win_temp() or "(introuvable, j'utilise Ubuntu)", flush=True)
+    try:
+        asyncio.run(speak_on_pc("Bonjour Monsieur, ceci est un test de mes haut-parleurs.", wait=True, s=s))
+        ok("Son joué sur l'ordinateur — tu l'as entendu ? Sinon vérifie le volume et la sortie audio de Windows.")
+    except Exception as exc:  # noqa: BLE001
+        ko(f"Son sur l'ordinateur impossible : {exc}")
+    try:
+        names = [m["name"] for m in httpx.get(f"{OLLAMA}/api/tags", timeout=5).json().get("models", [])]
+        ok(f"Ollama répond, modèles : {', '.join(names) or 'AUCUN'} (config : {MODEL})")
+    except Exception as exc:  # noqa: BLE001
+        ko(f"Ollama ne répond pas : {exc}")
+    try:
+        httpx.get(f"http://127.0.0.1:{WEB_PORT}/", timeout=5).raise_for_status()
+        ok(f"Jarvis tourne (page http://localhost:{WEB_PORT} OK)")
+    except Exception:  # noqa: BLE001
+        ko("Jarvis ne tourne pas en ce moment (regarde : tail -20 ~/.openjarvis/jarvis-voix.log)")
+    print("\nCopie tout ce qui est au-dessus à Claude si quelque chose est en ❌.\n")
+
+
 def choisir_voix() -> None:
     """Fait écouter chaque voix sur l'ordinateur, puis enregistre celle choisie."""
     s = load_settings()
@@ -124,7 +160,7 @@ def choisir_voix() -> None:
         try:
             asyncio.run(speak_on_pc(phrase, wait=True, s=essai))
         except Exception as exc:  # noqa: BLE001
-            print(f"     (impossible de jouer cette voix : {exc})")
+            print(f"     ❌ impossible de jouer cette voix : {exc}")
         time.sleep(0.4)
     actuel = next((str(i) for i, v in enumerate(VOIX, 1)
                    if v[1] == s.get("voice") and v[2] == s.get("voice_rate", "+0%")), "1")
@@ -791,34 +827,75 @@ _pc_lock = asyncio.Lock()
 _bg_tasks: set = set()
 
 
+_win_temp_cache: dict = {}
+
+
+def _win_temp() -> Path | None:
+    """Dossier temporaire de Windows (vu depuis Ubuntu), pour que Windows lise le son sans souci."""
+    if "dir" in _win_temp_cache:
+        return _win_temp_cache["dir"]
+    d = None
+    if shutil.which("powershell.exe"):
+        try:
+            r = subprocess.run(["powershell.exe", "-NoProfile", "-Command",
+                                "[Console]::OutputEncoding=[Text.Encoding]::UTF8; [IO.Path]::GetTempPath()"],
+                               capture_output=True, text=True, timeout=30, cwd="/mnt/c" if os.path.isdir("/mnt/c") else None,
+                               stdin=subprocess.DEVNULL)
+            win = r.stdout.strip().splitlines()[-1].strip() if r.stdout.strip() else ""
+            if win:
+                lin = subprocess.run(["wslpath", "-u", win], capture_output=True, text=True).stdout.strip()
+                if lin and os.path.isdir(lin):
+                    d = Path(lin) / "jarvis-voix"
+                    d.mkdir(exist_ok=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Dossier temporaire Windows introuvable ({exc}), j'utilise celui d'Ubuntu.", flush=True)
+    _win_temp_cache["dir"] = d
+    return d
+
+
+def _play_cmd(wav: Path) -> tuple[list[str], str | None]:
+    if shutil.which("powershell.exe"):
+        win = subprocess.run(["wslpath", "-w", str(wav)], capture_output=True, text=True, check=True).stdout.strip()
+        win = win.replace("'", "''")
+        script = ("$ErrorActionPreference='Stop'; $p = New-Object Media.SoundPlayer '" + win + "'; "
+                  "$p.Load(); $p.PlaySync()")
+        return ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script], (
+            "/mnt/c" if os.path.isdir("/mnt/c") else None)
+    if shutil.which("paplay"):
+        return ["paplay", str(wav)], None
+    if shutil.which("aplay"):
+        return ["aplay", "-q", str(wav)], None
+    raise RuntimeError("aucun lecteur audio trouvé (ni Windows, ni paplay/aplay)")
+
+
 async def speak_on_pc(text: str, wait: bool = False, s: dict | None = None) -> None:
-    """Dit le texte sur les haut-parleurs de l'ordinateur (Windows via WSL, ou Linux)."""
-    out_dir = Path(tempfile.gettempdir()) / "jarvis-voix"
+    """Dit le texte sur les haut-parleurs de l'ordinateur (Windows via WSL, ou Linux).
+    Avec wait=True, attend la fin et lève une erreur claire si le son n'a pas pu être joué."""
+    out_dir = await asyncio.to_thread(_win_temp) or Path(tempfile.gettempdir()) / "jarvis-voix"
     out_dir.mkdir(exist_ok=True)
     wav = out_dir / f"{time.time_ns()}.wav"
     await synth(text, str(wav), s)
-    if shutil.which("powershell.exe"):
-        win = subprocess.run(["wslpath", "-w", str(wav)], capture_output=True, text=True, check=True).stdout.strip()
-        cmd = ["powershell.exe", "-NoProfile", "-Command",
-               f"(New-Object Media.SoundPlayer '{win}').PlaySync()"]
-        cwd = "/mnt/c" if os.path.isdir("/mnt/c") else None
-    elif shutil.which("paplay"):
-        cmd, cwd = ["paplay", str(wav)], None
-    elif shutil.which("aplay"):
-        cmd, cwd = ["aplay", "-q", str(wav)], None
-    else:
-        raise RuntimeError("aucun lecteur audio trouvé")
+    cmd, cwd = _play_cmd(wav)
 
     async def play():
-        async with _pc_lock:  # une phrase à la fois
-            await asyncio.to_thread(subprocess.run, cmd, cwd=cwd, capture_output=True, timeout=300,
-                                    stdin=subprocess.DEVNULL)
-        wav.unlink(missing_ok=True)
+        try:
+            async with _pc_lock:  # une phrase à la fois
+                r = await asyncio.to_thread(subprocess.run, cmd, cwd=cwd, capture_output=True, text=True,
+                                            timeout=300, stdin=subprocess.DEVNULL)
+            if r.returncode != 0:
+                raise RuntimeError(f"le lecteur audio a échoué : {(r.stderr or r.stdout).strip()[-400:]}")
+        finally:
+            wav.unlink(missing_ok=True)
 
     if wait:
         await play()
     else:
-        task = asyncio.create_task(play())
+        async def play_logged():
+            try:
+                await play()
+            except Exception as exc:  # noqa: BLE001
+                print(f"Voix sur l'ordinateur : {exc}", flush=True)
+        task = asyncio.create_task(play_logged())
         _bg_tasks.add(task)
         task.add_done_callback(_bg_tasks.discard)
 
@@ -1518,5 +1595,7 @@ if __name__ == "__main__":
         reglages()
     elif len(sys.argv) > 1 and sys.argv[1] == "voix":
         choisir_voix()
+    elif len(sys.argv) > 1 and sys.argv[1] in ("diagnostic", "diag", "test"):
+        diagnostic()
     else:
         main()
