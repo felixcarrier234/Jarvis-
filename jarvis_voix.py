@@ -16,6 +16,7 @@ Usage :
     python jarvis_voix.py reglages   # configure courriel / agenda / rappels
     python jarvis_voix.py voix       # écouter et choisir la voix de Jarvis
     python jarvis_voix.py modele     # choisir la meilleure IA selon la carte graphique
+    python jarvis_voix.py accelerer  # reconnaissance vocale sur la carte graphique (NVIDIA)
     python jarvis_voix.py diagnostic # tout tester
 
 Parle directement à Ollama (le moteur d'IA local installé avec OpenJarvis).
@@ -138,6 +139,10 @@ def diagnostic() -> None:
         ok("Son joué sur l'ordinateur — tu l'as entendu ? Sinon vérifie le volume et la sortie audio de Windows.")
     except Exception as exc:  # noqa: BLE001
         ko(f"Son sur l'ordinateur impossible : {exc}")
+    ok("« Hey Jarvis » installé") if charger_mot_reveil() else ko(
+        "« Hey Jarvis » absent : ~/.local/bin/uv pip install --python ~/.jarvis-voix/bin/python openwakeword==0.4.0")
+    print("  … reconnaissance vocale :", "carte graphique" if s.get("whisper_gpu") else
+          "processeur (pour accélérer : jarvis_voix.py accelerer)", flush=True)
     smi = shutil.which("nvidia-smi") or ("/usr/lib/wsl/lib/nvidia-smi" if os.path.exists("/usr/lib/wsl/lib/nvidia-smi") else None)
     if smi:
         r = subprocess.run([smi, "--query-gpu=name,memory.total", "--format=csv,noheader"], capture_output=True, text=True)
@@ -207,6 +212,31 @@ def choisir_modele() -> None:
             txt += f'\n[intelligence]\ndefault_model = "{modele}"\n'
         CONFIG.write_text(txt)
         print(f"\n✅ Jarvis utilisera maintenant {modele}. Redémarre-le :  pkill -f jarvis_voix.py")
+
+
+def accelerer() -> None:
+    """Installe les bibliothèques NVIDIA pour que la reconnaissance vocale tourne sur la carte graphique."""
+    uv = shutil.which("uv") or str(Path.home() / ".local/bin/uv")
+    print("Téléchargement des bibliothèques NVIDIA (environ 1 Go, quelques minutes)…", flush=True)
+    r = subprocess.run([uv, "pip", "install", "--python", sys.executable, "nvidia-cublas-cu12", "nvidia-cudnn-cu12==9.*"])
+    if r.returncode != 0:
+        print("❌ Installation impossible.")
+        return
+    if not _precharger_cuda():
+        print("❌ Bibliothèques introuvables après l'installation.")
+        return
+    try:
+        from faster_whisper import WhisperModel
+
+        print("Test de la reconnaissance vocale sur la carte graphique…", flush=True)
+        WhisperModel(WHISPER_MODEL, device="cuda", compute_type="float16")
+    except Exception as exc:  # noqa: BLE001
+        print(f"❌ La carte graphique refuse ({exc}). On reste sur le processeur, ça marche quand même.")
+        return
+    s = load_settings()
+    s["whisper_gpu"] = True
+    save_settings(s)
+    print("✅ La reconnaissance vocale utilisera la carte graphique. Redémarre Jarvis :  pkill -f jarvis_voix.py")
 
 
 def choisir_voix() -> None:
@@ -1101,6 +1131,7 @@ async def llm(messages: list[dict]) -> str:
             "stream": False,
             "think": False,
             "options": {"num_ctx": 8192, "temperature": 0.6},
+            "keep_alive": "60m",  # garde l'IA chargée dans la carte graphique : réponses plus rapides
         }
         r = await client.post(f"{OLLAMA}/api/chat", json=body)
         if r.status_code == 400 and "think" in r.text:
@@ -1151,21 +1182,87 @@ async def gather_context(question: str, s: dict) -> str:
     return "\n\n".join(parts)
 
 
-async def ask_jarvis(chat_id: int, question: str) -> str:
+async def _messages_pour(chat_id: int, question: str) -> list[dict]:
     s = load_settings()
     extra = await gather_context(question, s)
-    h = history[chat_id]
     content = question
     if extra:
         content = (
             "Voici mes vraies données (utilise-les pour me répondre, n'invente rien d'autre) :\n\n"
             f"{extra}\n\nMa question : {question}"
         )
-    messages = [{"role": "system", "content": system_prompt()}, *h, {"role": "user", "content": content}]
+    return [{"role": "system", "content": system_prompt()}, *history[chat_id], {"role": "user", "content": content}]
+
+
+async def ask_jarvis(chat_id: int, question: str) -> str:
+    messages = await _messages_pour(chat_id, question)
     answer = await llm(messages) or "Désolé, je n'ai pas de réponse."
-    h.append({"role": "user", "content": question})
-    h.append({"role": "assistant", "content": answer})
+    history[chat_id].append({"role": "user", "content": question})
+    history[chat_id].append({"role": "assistant", "content": answer})
     return answer
+
+
+async def llm_stream(messages: list[dict]):
+    """Réponse de l'IA morceau par morceau (pour commencer à parler plus tôt)."""
+    async with httpx.AsyncClient(timeout=600) as client:
+        body = {"model": await pick_model(client), "messages": messages, "stream": True, "think": False,
+                "options": {"num_ctx": 8192, "temperature": 0.6}, "keep_alive": "60m"}
+        for essai in range(2):
+            async with client.stream("POST", f"{OLLAMA}/api/chat", json=body) as r:
+                if r.status_code == 400 and essai == 0:
+                    await r.aread()
+                    body.pop("think", None)
+                    continue
+                r.raise_for_status()
+                dans_reflexion = False
+                async for ligne in r.aiter_lines():
+                    if not ligne.strip():
+                        continue
+                    morceau = json.loads(ligne).get("message", {}).get("content", "")
+                    if "<think>" in morceau:
+                        dans_reflexion = True
+                    if dans_reflexion:
+                        if "</think>" in morceau:
+                            dans_reflexion = False
+                            morceau = morceau.split("</think>", 1)[1]
+                        else:
+                            continue
+                    if morceau:
+                        yield morceau
+                return
+
+
+FIN_PHRASE = re.compile(r"(?<=[.!?…:;])\s+(?=[A-ZÀ-Ý«\"0-9])|\n+")
+
+
+async def phrases(flux):
+    """Regroupe un flux de texte en phrases (dès qu'une phrase est complète, on la donne)."""
+    tampon = ""
+    async for morceau in flux:
+        tampon += morceau
+        while True:
+            m = FIN_PHRASE.search(tampon)
+            if not m or m.start() < 12:
+                break
+            phrase, tampon = tampon[:m.start()], tampon[m.end():]
+            if clean(phrase):
+                yield clean(phrase)
+    if clean(tampon):
+        yield clean(tampon)
+
+
+async def ask_jarvis_stream(chat_id: int, question: str):
+    """Comme ask_jarvis, mais donne la réponse phrase par phrase."""
+    messages = await _messages_pour(chat_id, question)
+    toutes = []
+    async for ph in phrases(llm_stream(messages)):
+        toutes.append(ph)
+        yield ph
+    answer = " ".join(toutes) or "Désolé, je n'ai pas de réponse."
+    if not toutes:
+        yield answer
+    history[chat_id].append({"role": "user", "content": question})
+    history[chat_id].append({"role": "assistant", "content": answer})
 
 
 # ---------------------------------------------------------------------------
@@ -1173,6 +1270,28 @@ async def ask_jarvis(chat_id: int, question: str) -> str:
 # ---------------------------------------------------------------------------
 
 _whisper = None
+_whisper_info = {"appareil": "pas encore chargé"}
+
+
+def _precharger_cuda() -> bool:
+    """Charge les bibliothèques CUDA installées par « jarvis_voix.py accelerer » (pip nvidia-*)."""
+    import ctypes
+    import glob
+    import site
+
+    libs = []
+    for base in site.getsitepackages():
+        for motif in ("nvidia/cublas/lib/libcublasLt.so*", "nvidia/cublas/lib/libcublas.so*",
+                      "nvidia/cudnn/lib/libcudnn*.so*"):
+            libs += sorted(glob.glob(os.path.join(base, motif)))
+    ok = False
+    for lib in libs:
+        try:
+            ctypes.CDLL(lib, mode=ctypes.RTLD_GLOBAL)
+            ok = True
+        except OSError:
+            pass
+    return ok
 
 
 def whisper():
@@ -1180,13 +1299,23 @@ def whisper():
     if _whisper is None:
         from faster_whisper import WhisperModel
 
+        if load_settings().get("whisper_gpu") and _precharger_cuda():
+            try:
+                print(f"Chargement de la reconnaissance vocale ({WHISPER_MODEL}) sur la carte graphique…", flush=True)
+                _whisper = WhisperModel(WHISPER_MODEL, device="cuda", compute_type="float16")
+                _whisper_info["appareil"] = "carte graphique (rapide)"
+                return _whisper
+            except Exception as exc:  # noqa: BLE001
+                print(f"Carte graphique indisponible pour la voix ({exc}), j'utilise le processeur.", flush=True)
         print(f"Chargement de la reconnaissance vocale ({WHISPER_MODEL})…", flush=True)
         _whisper = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+        _whisper_info["appareil"] = "processeur"
     return _whisper
 
 
 def transcribe(path: str) -> str:
-    segments, _ = whisper().transcribe(path, language="fr")
+    segments, _ = whisper().transcribe(path, language="fr", beam_size=1 if _whisper_info["appareil"] == "processeur" else 5,
+                                       vad_filter=True)
     return " ".join(seg.text.strip() for seg in segments).strip()
 
 
@@ -1224,6 +1353,17 @@ def stop_pc_voice() -> None:
     proc = _lecture.get("proc")
     if proc is not None and proc.poll() is None:
         proc.terminate()
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop and _etat["v"] == "parle":
+        async def repos_si_toujours_parle():
+            if _etat["v"] == "parle":  # pas si on vient de passer à « j'écoute »
+                await changer_etat("repos")
+        task = loop.create_task(repos_si_toujours_parle())
+        _bg_tasks.add(task)
+        task.add_done_callback(_bg_tasks.discard)
 
 
 _win_temp_cache: dict = {}
@@ -1267,52 +1407,133 @@ def _play_cmd(wav: Path) -> tuple[list[str], str | None]:
     raise RuntimeError("aucun lecteur audio trouvé (ni Windows, ni paplay/aplay)")
 
 
+# Les pages Jarvis ouvertes (pour leur dire « j'écoute », « je parle », etc.)
+HUB: set = set()
+_etat = {"v": "repos", "parle": 0}
+
+
+async def diffuser(msg: dict) -> None:
+    for ws in list(HUB):
+        try:
+            await ws.send_json(msg)
+        except Exception:  # noqa: BLE001
+            HUB.discard(ws)
+
+
+async def changer_etat(v: str) -> None:
+    if _etat["v"] != v:
+        _etat["v"] = v
+        await diffuser({"t": "etat", "v": v})
+
+
+async def preparer_son(text: str, s: dict | None = None) -> Path:
+    """Fabrique le fichier .wav à jouer sur l'ordinateur (voix, carillon ou bip)."""
+    out_dir = await asyncio.to_thread(_win_temp) or Path(tempfile.gettempdir()) / "jarvis-voix"
+    out_dir.mkdir(exist_ok=True)
+    wav = out_dir / f"{time.time_ns()}.wav"
+    sons = {
+        "<carillon>": ["-f", "lavfi", "-i", "sine=f=660:d=0.12", "-f", "lavfi", "-i", "sine=f=880:d=0.12",
+                       "-f", "lavfi", "-i", "sine=f=1320:d=0.35", "-filter_complex",
+                       "[0][1][2]concat=n=3:v=0:a=1,afade=t=out:st=0.35:d=0.24,aecho=0.8:0.5:60:0.3,volume=0.5"],
+        "<bip>": ["-f", "lavfi", "-i", "sine=f=880:d=0.09", "-f", "lavfi", "-i", "sine=f=1320:d=0.11",
+                  "-filter_complex", "[0][1]concat=n=2:v=0:a=1,afade=t=out:st=0.12:d=0.08,volume=0.35"],
+    }
+    if text in sons:
+        await asyncio.to_thread(subprocess.run, ["ffmpeg", "-nostdin", "-y", "-loglevel", "error", *sons[text], str(wav)],
+                                check=True)
+    else:
+        await synth(text, str(wav), s)
+    return wav
+
+
+async def jouer_son(wav: Path, gen: int, effet: bool = False) -> None:
+    """Joue un .wav sur l'ordinateur, une phrase à la fois ; « stop » coupe tout.
+    effet=True (bip, carillon) : ne change pas l'état affiché."""
+    cmd, cwd = _play_cmd(wav)
+    _etat["parle"] += 0 if effet else 1
+    try:
+        async with _pc_lock:
+            if gen != _lecture["gen"]:
+                return
+            if not effet:
+                await changer_etat("parle")
+            proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    stdin=subprocess.DEVNULL, text=True)
+            _lecture["proc"] = proc
+            try:
+                out, err = await asyncio.to_thread(proc.communicate, timeout=300)
+            finally:
+                _lecture["proc"] = None
+        if proc.returncode != 0 and gen == _lecture["gen"]:
+            raise RuntimeError(f"le lecteur audio a échoué : {(err or out).strip()[-400:]}")
+    finally:
+        wav.unlink(missing_ok=True)
+        if not effet:
+            _etat["parle"] -= 1
+            if _etat["parle"] <= 0 and _etat["v"] == "parle":
+                await changer_etat("repos")
+
+
 async def speak_on_pc(text: str, wait: bool = False, s: dict | None = None) -> None:
     """Dit le texte sur les haut-parleurs de l'ordinateur (Windows via WSL, ou Linux).
     Avec wait=True, attend la fin et lève une erreur claire si le son n'a pas pu être joué."""
     gen = _lecture["gen"]
-    out_dir = await asyncio.to_thread(_win_temp) or Path(tempfile.gettempdir()) / "jarvis-voix"
-    out_dir.mkdir(exist_ok=True)
-    wav = out_dir / f"{time.time_ns()}.wav"
-    if text == "<carillon>":
-        await asyncio.to_thread(subprocess.run, [
-            "ffmpeg", "-nostdin", "-y", "-loglevel", "error",
-            "-f", "lavfi", "-i", "sine=f=660:d=0.12", "-f", "lavfi", "-i", "sine=f=880:d=0.12",
-            "-f", "lavfi", "-i", "sine=f=1320:d=0.35", "-filter_complex",
-            "[0][1][2]concat=n=3:v=0:a=1,afade=t=out:st=0.35:d=0.24,aecho=0.8:0.5:60:0.3,volume=0.5", str(wav)],
-            check=True)
-    else:
-        await synth(text, str(wav), s)
-    cmd, cwd = _play_cmd(wav)
-
-    async def play():
-        try:
-            async with _pc_lock:  # une phrase à la fois
-                if gen != _lecture["gen"]:
-                    return  # « stop » demandé entre-temps
-                proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                        stdin=subprocess.DEVNULL, text=True)
-                _lecture["proc"] = proc
-                try:
-                    out, err = await asyncio.to_thread(proc.communicate, timeout=300)
-                finally:
-                    _lecture["proc"] = None
-            if proc.returncode != 0 and gen == _lecture["gen"]:
-                raise RuntimeError(f"le lecteur audio a échoué : {(err or out).strip()[-400:]}")
-        finally:
-            wav.unlink(missing_ok=True)
-
+    effet = text.startswith("<") and text.endswith(">")
+    wav = await preparer_son(text, s)
     if wait:
-        await play()
+        await jouer_son(wav, gen, effet)
     else:
         async def play_logged():
             try:
-                await play()
+                await jouer_son(wav, gen, effet)
             except Exception as exc:  # noqa: BLE001
                 print(f"Voix sur l'ordinateur : {exc}", flush=True)
         task = asyncio.create_task(play_logged())
         _bg_tasks.add(task)
         task.add_done_callback(_bg_tasks.discard)
+
+
+async def dire_phrases(source) -> str:
+    """Dit des phrases au fur et à mesure qu'elles arrivent : la phrase suivante est fabriquée
+    pendant que la précédente est jouée. Retourne tout le texte."""
+    gen = _lecture["gen"]
+    fabriques: asyncio.Queue = asyncio.Queue()
+    texte = []
+
+    async def producteur():
+        async for ph in source:
+            texte.append(ph)
+            await diffuser({"t": "jarvis", "texte": ph, "suite": len(texte) > 1})
+            fabriques.put_nowait(asyncio.create_task(preparer_son(ph)))
+        fabriques.put_nowait(None)
+
+    prod = asyncio.create_task(producteur())
+    _etat["parle"] += 1  # « je parle » pendant toute la réponse, même entre deux phrases
+    try:
+        while True:
+            tache = await fabriques.get()
+            if tache is None:
+                break
+            try:
+                wav = await tache
+                if gen == _lecture["gen"]:
+                    await jouer_son(wav, gen)
+                else:
+                    wav.unlink(missing_ok=True)
+            except Exception as exc:  # noqa: BLE001
+                print(f"Voix sur l'ordinateur : {exc}", flush=True)
+    finally:
+        if not prod.done():
+            prod.cancel()  # coupé (« stop » ou « Hey Jarvis ») : on arrête de lire la réponse de l'IA
+        await asyncio.gather(prod, return_exceptions=True)
+        while not fabriques.empty():
+            t = fabriques.get_nowait()
+            if t is not None:
+                t.cancel()
+        _etat["parle"] -= 1
+        if _etat["parle"] <= 0 and _etat["v"] == "parle":
+            await changer_etat("repos")
+    return " ".join(texte)
 
 
 async def say(bot, chat_id: int | str, text: str, reply_to=None) -> None:
@@ -1375,6 +1596,12 @@ def conversation_id() -> int:
 
 async def handle_question(question: str) -> str:
     """Stop, rappel, mémoire, listes, sinon question à Jarvis. Retourne le texte de la réponse."""
+    r = intention(question)
+    return r if r is not None else await ask_jarvis(conversation_id(), question)
+
+
+def intention(question: str) -> str | None:
+    """Les commandes qui n'ont pas besoin de l'IA (stop, rappels, mémoire, listes). None sinon."""
     if MOTS_STOP.match(question):
         stop_pc_voice()
         return "D'accord."
@@ -1398,7 +1625,7 @@ async def handle_question(question: str) -> str:
             "Je ne sais encore rien sur toi. Dis-moi par exemple : souviens-toi que j'adore le café."
     if (rep_liste := gerer_listes(question)) is not None:
         return rep_liste
-    return await ask_jarvis(conversation_id(), question)
+    return None
 
 
 async def cmd_courriels(update, context) -> None:
@@ -1871,156 +2098,155 @@ PAGE = r"""<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Jarvis</title>
 <style>
-  :root { --bg:#0b1020; --panel:#121a33; --text:#e8ecff; --muted:#8d97c7; --accent:#4cc9ff; --me:#1f2b55; --warn:#ffb74d; }
+  :root { --bg:#03070f; --text:#d8f6ff; --muted:#6f9bb0; --cyan:#3fd8ff; --cyan-dim:#1b6f8a; --amber:#ffb547;
+          --white:#e9fdff; --panel:#071524cc; --line:#123446; --niveau:0; }
   * { box-sizing:border-box; }
-  body { margin:0; min-height:100vh; background:radial-gradient(circle at 50% 0%, #17224a, var(--bg) 60%);
-         color:var(--text); font:16px/1.45 system-ui, "Segoe UI", sans-serif; display:flex; flex-direction:column; align-items:center; }
-  header { width:100%; max-width:760px; padding:20px 16px 0; display:flex; justify-content:space-between; align-items:center; }
-  h1 { font-size:20px; letter-spacing:.2em; margin:0; font-weight:600; }
-  #etat { color:var(--muted); font-size:14px; }
-  #orbe { margin:28px 0 12px; width:190px; height:190px; border-radius:50%; border:none; cursor:pointer; position:relative;
-          background:radial-gradient(circle at 35% 30%, #9be7ff, var(--accent) 35%, #0a6aa8 70%, #062a4a);
-          box-shadow:0 0 40px #4cc9ff55, inset 0 0 30px #00000066; transition:transform .2s, box-shadow .3s; }
-  #orbe:focus-visible { outline:3px solid #fff; outline-offset:6px; }
-  #orbe.ecoute { animation:pulse 1.4s ease-in-out infinite; }
-  #orbe.parle { box-shadow:0 0 80px #4cc9ffaa, inset 0 0 30px #00000066; animation:parle .5s ease-in-out infinite alternate; }
-  #orbe.pense { animation:tourne 1.2s linear infinite; filter:saturate(.6); }
-  #orbe.arret { filter:grayscale(.7) brightness(.7); }
-  #niveau { position:absolute; inset:-10px; border-radius:50%; border:3px solid #4cc9ff; opacity:0; transition:opacity .1s, transform .1s; pointer-events:none; }
-  @keyframes pulse { 50% { transform:scale(1.06); box-shadow:0 0 60px #4cc9ff88, inset 0 0 30px #00000066; } }
-  @keyframes parle { to { transform:scale(1.08); } }
-  @keyframes tourne { to { filter:saturate(.6) hue-rotate(360deg); } }
-  #consigne { color:var(--muted); margin:0 16px 18px; text-align:center; min-height:1.4em; }
-  .ecouter { margin-top:8px; background:none; border:1px solid var(--accent); color:var(--accent); border-radius:10px; padding:4px 10px; cursor:pointer; }
-  #fil { width:100%; max-width:760px; padding:0 16px; flex:1; display:flex; flex-direction:column; gap:10px; overflow-y:auto; }
-  .bulle { max-width:85%; padding:10px 14px; border-radius:14px; background:var(--panel); white-space:pre-wrap; }
-  .moi { align-self:flex-end; background:var(--me); }
-  .erreur { color:var(--warn); }
-  form { width:100%; max-width:760px; padding:14px 16px 20px; display:flex; gap:8px; }
-  input { flex:1; min-width:0; padding:12px 14px; border-radius:12px; border:1px solid #2a3770; background:#0e1530; color:var(--text); font-size:16px; }
-  button.envoyer { padding:0 18px; border-radius:12px; border:none; background:var(--accent); color:#04233a; font-weight:600; cursor:pointer; }
+  html, body { height:100%; }
+  body { margin:0; background:radial-gradient(ellipse at 50% 30%, #082036 0%, var(--bg) 62%); color:var(--text);
+         font:15px/1.45 "Segoe UI", system-ui, sans-serif; display:flex; flex-direction:column; align-items:center; overflow-x:hidden; }
+  body::before { content:""; position:fixed; inset:0; pointer-events:none; opacity:.25;
+         background:repeating-linear-gradient(0deg, transparent 0 3px, #0d3a4f22 3px 4px); }
+  header { width:100%; max-width:900px; padding:16px 16px 0; display:flex; justify-content:space-between; align-items:flex-start; gap:12px; }
+  .logo { font-weight:600; letter-spacing:.42em; font-size:18px; color:var(--cyan); text-shadow:0 0 12px #3fd8ff88; }
+  .sous { color:var(--muted); font-size:11px; letter-spacing:.25em; text-transform:uppercase; margin-top:4px; }
+  .horloge { text-align:right; font-variant-numeric:tabular-nums; }
+  .horloge b { font-size:22px; font-weight:500; color:var(--white); letter-spacing:.05em; }
+  .horloge div { color:var(--muted); font-size:12px; text-transform:capitalize; }
+  #reacteur { margin:6px 0 0; width:min(340px, 82vw); aspect-ratio:1; border:none; background:none; padding:0; cursor:pointer;
+              position:relative; -webkit-tap-highlight-color:transparent; }
+  #reacteur:focus-visible { outline:2px solid var(--cyan); outline-offset:4px; border-radius:50%; }
+  #reacteur svg { width:100%; height:100%; overflow:visible; }
+  .anneau { transform-origin:200px 200px; }
+  .a1 { animation:tourne 40s linear infinite; } .a2 { animation:tourne 24s linear infinite reverse; }
+  .a3 { animation:tourne 14s linear infinite; } .a4 { animation:tourne 60s linear infinite reverse; }
+  @keyframes tourne { to { transform:rotate(360deg); } }
+  .trait { stroke:var(--cyan); fill:none; transition:stroke .4s, opacity .4s; }
+  #coeur { transform-origin:200px 200px; transform:scale(calc(1 + var(--niveau) * .35)); transition:transform .08s linear, fill .4s; fill:url(#lueur); }
+  #halo { transform-origin:200px 200px; opacity:calc(.25 + var(--niveau) * .9); transition:opacity .08s; }
+  body.repos .trait { opacity:.55; } body.repos #coeur { animation:respire 4s ease-in-out infinite; }
+  @keyframes respire { 50% { transform:scale(1.04); } }
+  body.ecoute .trait, body.suivi .trait { stroke:var(--cyan); opacity:1; filter:drop-shadow(0 0 6px #3fd8ff); }
+  body.pense .trait { stroke:var(--amber); opacity:.95; } body.pense .a2 { animation-duration:2.5s; } body.pense .a3 { animation-duration:1.6s; }
+  body.pense #coeur { fill:url(#lueurAmbre); animation:respire 1s ease-in-out infinite; }
+  body.parle .trait { stroke:var(--white); opacity:1; filter:drop-shadow(0 0 8px #bff4ff); }
+  body.parle #coeur { animation:voix .35s ease-in-out infinite alternate; }
+  @keyframes voix { from { transform:scale(.96); } to { transform:scale(1.14); } }
+  body.reveil #reacteur { animation:flash .5s ease-out; } @keyframes flash { 40% { filter:brightness(1.8); } }
+  #statut { margin:2px 0 4px; color:var(--cyan); letter-spacing:.3em; font-size:12px; text-transform:uppercase; min-height:1.4em; text-align:center; }
+  #aide { color:var(--muted); font-size:13px; margin:0 16px 10px; text-align:center; min-height:1.3em; }
+  .commandes { display:flex; gap:8px; flex-wrap:wrap; justify-content:center; margin-bottom:10px; }
+  .pilule { border:1px solid var(--line); background:var(--panel); color:var(--text); border-radius:999px; padding:6px 12px;
+            font-size:13px; cursor:pointer; }
+  .pilule[aria-pressed="true"] { border-color:var(--cyan); color:var(--cyan); box-shadow:0 0 10px #3fd8ff44 inset; }
+  .pilule.alerte { border-color:var(--amber); color:var(--amber); }
+  #fil { width:100%; max-width:760px; padding:0 16px; flex:1; display:flex; flex-direction:column; gap:8px; overflow-y:auto; min-height:120px; }
+  .bulle { max-width:88%; padding:9px 13px; border-radius:4px 14px 14px 14px; background:var(--panel); border:1px solid var(--line);
+           white-space:pre-wrap; animation:entre .25s ease-out; }
+  .bulle.moi { align-self:flex-end; border-radius:14px 4px 14px 14px; border-color:#1d4f66; background:#0b2236cc; }
+  .bulle.erreur { border-color:var(--amber); color:var(--amber); }
+  .bulle .qui { display:block; font-size:10px; letter-spacing:.2em; color:var(--muted); text-transform:uppercase; margin-bottom:2px; }
+  @keyframes entre { from { opacity:0; transform:translateY(6px); } }
+  form { width:100%; max-width:760px; padding:12px 16px 18px; display:flex; gap:8px; }
+  input { flex:1; min-width:0; padding:11px 13px; border-radius:10px; border:1px solid var(--line); background:#06111dcc; color:var(--text); font-size:15px; }
+  input:focus { outline:1px solid var(--cyan); }
+  form button { padding:0 16px; border-radius:10px; border:1px solid var(--cyan); background:#0b3346; color:var(--cyan); font-weight:600; cursor:pointer; }
+  @media (prefers-reduced-motion: reduce) { .anneau, #coeur { animation:none !important; } }
 </style></head>
-<body>
-<header><h1>JARVIS</h1><span id="etat">prêt</span></header>
-<button id="orbe" class="arret" aria-label="Commencer ou arrêter la conversation"><span id="niveau"></span></button>
-<p id="consigne">Clique sur le cercle (ou appuie sur Espace) pour me parler.</p>
+<body class="repos">
+<header>
+  <div><div class="logo">J.A.R.V.I.S.</div><div class="sous" id="sous">Systèmes en ligne</div></div>
+  <div class="horloge"><b id="heure">--:--</b><div id="date"></div></div>
+</header>
+<button id="reacteur" aria-label="Parler à Jarvis (ou le faire taire s'il parle)">
+<svg viewBox="0 0 400 400" aria-hidden="true">
+  <defs>
+    <radialGradient id="lueur"><stop offset="0" stop-color="#ffffff"/><stop offset=".35" stop-color="#9ff0ff"/>
+      <stop offset=".7" stop-color="#2bbfe8" stop-opacity=".55"/><stop offset="1" stop-color="#0a4a66" stop-opacity="0"/></radialGradient>
+    <radialGradient id="lueurAmbre"><stop offset="0" stop-color="#fff"/><stop offset=".4" stop-color="#ffd08a"/>
+      <stop offset=".75" stop-color="#ff9d2e" stop-opacity=".5"/><stop offset="1" stop-color="#5a3000" stop-opacity="0"/></radialGradient>
+    <radialGradient id="flou"><stop offset="0" stop-color="#3fd8ff" stop-opacity=".35"/><stop offset="1" stop-color="#3fd8ff" stop-opacity="0"/></radialGradient>
+  </defs>
+  <circle id="halo" cx="200" cy="200" r="190" fill="url(#flou)"/>
+  <g class="anneau a4"><circle class="trait" cx="200" cy="200" r="186" stroke-width="1" stroke-dasharray="2 10"/></g>
+  <g class="anneau a1"><circle class="trait" cx="200" cy="200" r="168" stroke-width="3" stroke-dasharray="60 18 8 18"/></g>
+  <g class="anneau a2"><circle class="trait" cx="200" cy="200" r="140" stroke-width="10" stroke-dasharray="30 12" opacity=".8"/></g>
+  <g class="anneau a3"><circle class="trait" cx="200" cy="200" r="112" stroke-width="2" stroke-dasharray="120 40 10 40"/>
+     <circle class="trait" cx="200" cy="200" r="100" stroke-width="1"/></g>
+  <circle id="coeur" cx="200" cy="200" r="78"/>
+</svg></button>
+<div id="statut">En veille</div>
+<p id="aide">Dites « Hey Jarvis », cliquez sur le réacteur ou appuyez sur Espace.</p>
+<div class="commandes">
+  <button class="pilule" id="mainsLibres" aria-pressed="true">👂 « Hey Jarvis » activé</button>
+  <button class="pilule" id="micro" hidden>🎤 Activer le micro</button>
+  <button class="pilule" id="taire">🤫 Silence</button>
+</div>
 <div id="fil" aria-live="polite"></div>
-<form id="formulaire"><input id="texte" placeholder="…ou écris ta question ici" autocomplete="off">
-<button class="envoyer">Envoyer</button></form>
+<form id="formulaire"><input id="texte" placeholder="Écrire à Jarvis…" autocomplete="off"><button>Envoyer</button></form>
 <script>
-const orbe = document.getElementById('orbe'), niveau = document.getElementById('niveau'),
-      etat = document.getElementById('etat'), consigne = document.getElementById('consigne'),
-      fil = document.getElementById('fil');
-let actif = false, flux = null, ctx = null, analyseur = null, enregistreur = null, morceaux = [],
-    occupe = false, lecteur = new Audio(), fond = 0.01;
+const $ = id => document.getElementById(id), corps = document.body, fil = $('fil');
+const libelles = { repos: 'En veille', ecoute: "J'écoute…", suivi: "Je vous écoute encore…", pense: 'Analyse en cours…', parle: 'Jarvis parle' };
+let ws = null, flux = null, rec = null, etat = 'repos', dernierJarvis = null, mainsLibres = true;
+try { mainsLibres = localStorage.getItem('jarvis-mains-libres') !== 'non'; } catch (e) {}
 
-let recap = null;
-async function chargerRecap() {
-  const attente = document.createElement('div'); attente.className = 'bulle'; attente.textContent = '📋 Je prépare ton récap…';
-  fil.appendChild(attente); mode('pense', 'je prépare ton récap');
-  try { recap = await appel('/recap', { method: 'POST', body: JSON.stringify({ pc: true }), headers: { 'Content-Type': 'application/json' } }); }
-  catch (e) { attente.textContent = "📋 Je n'ai pas pu préparer le récap (" + e.message + ')'; mode('arret', 'prêt'); return; }
-  attente.textContent = '📋 ' + recap.reponse;
-  if (!actif) mode('arret', recap.parle_pc ? 'je te parle' : 'prêt');
-  if (!recap.parle_pc && recap.audio && !occupe) { occupe = true; jouer(recap, () => { occupe = false; if (actif) ecouter(); else mode('arret', 'prêt'); }); }
-  const b = document.createElement('button'); b.className = 'ecouter'; b.textContent = '🔊 Réécouter';
-  b.onclick = async () => { if (occupe) return; occupe = true;
-    let r = recap; if (!r.audio) { try { r = await appel('/recap', { method: 'POST', body: '{}', headers: { 'Content-Type': 'application/json' } }); } catch (e) {} }
-    jouer(r, () => { occupe = false; if (actif) ecouter(); else mode('arret', 'prêt'); }); };
-  attente.appendChild(document.createElement('br')); attente.appendChild(b);
-}
-function jouer(r, fin) {
-  mode('parle', 'je parle');
-  if (r.audio) { lecteur.src = 'data:audio/mpeg;base64,' + r.audio; lecteur.onended = fin; lecteur.onerror = fin; lecteur.play().catch(fin); }
-  else if (r.reponse) { const u = new SpeechSynthesisUtterance(r.reponse); u.lang = 'fr-FR'; u.onend = fin; u.onerror = fin; speechSynthesis.speak(u); }
-  else fin();
-}
+function horloge() { const d = new Date();
+  $('heure').textContent = d.toLocaleTimeString('fr-CA', { hour: '2-digit', minute: '2-digit' });
+  $('date').textContent = d.toLocaleDateString('fr-CA', { weekday: 'long', day: 'numeric', month: 'long' }); }
+horloge(); setInterval(horloge, 10000);
 
-function mode(m, txt) { orbe.className = m; etat.textContent = txt; }
-function ajoute(texte, classe) { const d = document.createElement('div'); d.className = 'bulle ' + (classe || '');
-  d.textContent = texte; fil.appendChild(d); fil.scrollTop = fil.scrollHeight; }
+function bulle(texte, qui, suite) {
+  if (suite && qui === 'jarvis' && dernierJarvis) { dernierJarvis.lastChild.textContent += ' ' + texte; fil.scrollTop = fil.scrollHeight; return; }
+  const d = document.createElement('div'); d.className = 'bulle ' + (qui === 'moi' ? 'moi' : qui === 'erreur' ? 'erreur' : '');
+  const q = document.createElement('span'); q.className = 'qui'; q.textContent = qui === 'moi' ? 'Vous' : qui === 'erreur' ? 'Erreur' : 'Jarvis';
+  d.appendChild(q); d.appendChild(document.createTextNode(texte)); fil.appendChild(d);
+  while (fil.children.length > 40) fil.firstChild.remove();
+  fil.scrollTop = fil.scrollHeight; dernierJarvis = qui === 'jarvis' ? d : null; }
+function changeEtat(v) { etat = v; corps.className = v; $('statut').textContent = libelles[v] || v;
+  if (v !== 'ecoute' && v !== 'suivi') corps.style.setProperty('--niveau', 0); }
+function majMainsLibres() { $('mainsLibres').setAttribute('aria-pressed', mainsLibres);
+  $('mainsLibres').textContent = mainsLibres ? '👂 « Hey Jarvis » activé' : '👂 « Hey Jarvis » désactivé';
+  $('aide').textContent = mainsLibres ? 'Dites « Hey Jarvis », cliquez sur le réacteur ou appuyez sur Espace.' : 'Cliquez sur le réacteur ou appuyez sur Espace pour parler.';
+  envoyer({ t: 'mains_libres', v: mainsLibres }); }
+function envoyer(m) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(m)); }
 
-function bip(f1, f2) { try { const c = new AudioContext(), o = c.createOscillator(), g = c.createGain();
-  o.frequency.setValueAtTime(f1, c.currentTime); o.frequency.linearRampToValueAtTime(f2, c.currentTime + .12);
-  g.gain.setValueAtTime(.12, c.currentTime); g.gain.exponentialRampToValueAtTime(.001, c.currentTime + .18);
-  o.connect(g).connect(c.destination); o.start(); o.stop(c.currentTime + .2); } catch (e) {} }
-function stopPC() { fetch('/stop', { method: 'POST', headers: { 'X-Jarvis': '1' } }).catch(() => {}); }
-
-async function demarrer() {
-  stopPC(); bip(520, 880);
+async function demarrerMicro() {
   try {
-    flux = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
-  } catch (e) { ajoute("Je n'ai pas accès au micro. Autorise-le dans le navigateur (icône 🔒 ou 🎤 dans la barre d'adresse).", 'erreur'); return; }
-  ctx = new AudioContext(); analyseur = ctx.createAnalyser(); analyseur.fftSize = 1024;
-  ctx.createMediaStreamSource(flux).connect(analyseur);
-  actif = true; consigne.textContent = "Je t'écoute… Parle normalement, je réponds quand tu t'arrêtes. Clique encore pour arrêter.";
-  ecouter();
-}
-function arreter() {
-  stopPC(); bip(880, 440);
-  actif = false; if (enregistreur && enregistreur.state !== 'inactive') enregistreur.stop();
-  if (flux) flux.getTracks().forEach(t => t.stop()); if (ctx) ctx.close(); flux = ctx = null;
-  lecteur.pause(); speechSynthesis.cancel(); mode('arret', 'en pause');
-  consigne.textContent = 'Clique sur le cercle (ou appuie sur Espace) pour parler à Jarvis.';
-}
-function volume() { const d = new Float32Array(analyseur.fftSize); analyseur.getFloatTimeDomainData(d);
-  let s = 0; for (const v of d) s += v * v; return Math.sqrt(s / d.length); }
-
-async function ecouter() {
-  if (!actif || occupe) return;
-  mode('ecoute', "j'écoute");
-  enregistreur = new MediaRecorder(flux); morceaux = [];
-  enregistreur.ondataavailable = e => { if (e.data.size) morceaux.push(e.data); };
-  let parle = false, debut = 0, dernierSon = 0; const t0 = performance.now();
-  enregistreur.onstop = async () => {
-    niveau.style.opacity = 0;
-    if (!actif) return;
-    if (!parle) { ecouter(); return; }
-    await envoyer(new Blob(morceaux, { type: enregistreur.mimeType }));
-  };
-  enregistreur.start(250);
-  const boucle = () => {
-    if (!actif || enregistreur.state === 'inactive') return;
-    const v = volume(), t = performance.now();
-    // Bruit de fond estimé en continu : descend vite, remonte lentement (la voix ne le fausse pas).
-    fond = v < fond ? v : fond * 0.998 + v * 0.002;
-    const seuil = Math.max(0.012, fond * 3);
-    niveau.style.opacity = Math.min(1, v / (seuil * 3)); niveau.style.transform = `scale(${1 + Math.min(.25, v * 3)})`;
-    if (v > seuil) { if (!parle) { parle = true; debut = t; } dernierSon = t; }
-    if (parle && t - dernierSon > 1300 && t - debut > 400) { bip(700, 500); return enregistreur.stop(); }   // fin de phrase
-    if (parle && t - debut > 30000) return enregistreur.stop();                          // 30 s max
-    if (!parle && t - t0 > 15000) return enregistreur.stop();                            // relance l'écoute
-    requestAnimationFrame(boucle);
-  };
-  boucle();
+    if (!flux) flux = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+    $('micro').hidden = true;
+  } catch (e) { $('micro').hidden = false; $('micro').classList.add('alerte'); $('aide').textContent = "Le micro n'est pas autorisé : cliquez sur « Activer le micro » puis sur Autoriser."; return; }
+  if (rec && rec.state !== 'inactive') rec.stop();
+  const types = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus'];
+  rec = new MediaRecorder(flux, { mimeType: types.find(t => MediaRecorder.isTypeSupported(t)) });
+  envoyer({ t: 'flux' });
+  rec.ondataavailable = e => { if (e.data.size && ws && ws.readyState === 1) ws.send(e.data); };
+  rec.start(100);
 }
 
-async function appel(url, options) {
-  const r = await fetch(url, { ...options, headers: { ...(options.headers || {}), 'X-Jarvis': '1' } });
-  if (!r.ok) throw new Error('erreur ' + r.status);
-  return r.json();
-}
-async function envoyer(blob) {
-  occupe = true; mode('pense', 'je réfléchis…');
-  try { repondre(await appel('/parler', { method: 'POST', body: blob, headers: { 'Content-Type': blob.type || 'audio/webm' } })); }
-  catch (e) { ajoute('Oups : ' + e.message, 'erreur'); occupe = false; ecouter(); }
-}
-async function ecrire(texte) {
-  occupe = true; ajoute(texte, 'moi'); mode('pense', 'je réfléchis…');
-  try { repondre(await appel('/ecrire', { method: 'POST', body: JSON.stringify({ texte }), headers: { 'Content-Type': 'application/json' } }), true); }
-  catch (e) { ajoute('Oups : ' + e.message, 'erreur'); occupe = false; ecouter(); }
-}
-function repondre(r, dejaAffiche) {
-  if (r.question && !dejaAffiche) ajoute(r.question, 'moi');
-  if (r.reponse) ajoute(r.reponse);
-  jouer(r, () => { occupe = false; if (actif) ecouter(); else mode('arret', 'prêt'); });
+function connecter() {
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onopen = () => { $('sous').textContent = 'Systèmes en ligne'; envoyer({ t: 'mains_libres', v: mainsLibres }); demarrerMicro(); };
+  ws.onclose = () => { $('sous').textContent = 'Connexion perdue… reconnexion'; if (rec && rec.state !== 'inactive') rec.stop(); setTimeout(connecter, 2000); };
+  ws.onmessage = e => { const m = JSON.parse(e.data);
+    if (m.t === 'etat') changeEtat(m.v);
+    else if (m.t === 'niveau') { if (etat === 'ecoute' || etat === 'suivi' || etat === 'repos') corps.style.setProperty('--niveau', etat === 'repos' ? m.v * .3 : m.v); }
+    else if (m.t === 'moi') bulle(m.texte, 'moi');
+    else if (m.t === 'jarvis') bulle(m.texte, 'jarvis', m.suite);
+    else if (m.t === 'erreur') bulle(m.texte, 'erreur');
+    else if (m.t === 'reveil') { corps.classList.add('reveil'); setTimeout(() => corps.classList.remove('reveil'), 500); } };
 }
 
-orbe.onclick = () => actif ? arreter() : demarrer();
-document.addEventListener('keydown', e => { if (e.code === 'Space' && document.activeElement.tagName !== 'INPUT') { e.preventDefault(); orbe.click(); } });
-document.getElementById('formulaire').onsubmit = e => { e.preventDefault(); const t = document.getElementById('texte');
-  if (t.value.trim() && !occupe) { ecrire(t.value.trim()); t.value = ''; } };
-chargerRecap();
+$('reacteur').onclick = () => envoyer({ t: etat === 'parle' || etat === 'pense' ? 'stop' : 'ecoute' });
+$('taire').onclick = () => envoyer({ t: 'stop' });
+$('micro').onclick = () => demarrerMicro();
+$('mainsLibres').onclick = () => { mainsLibres = !mainsLibres; try { localStorage.setItem('jarvis-mains-libres', mainsLibres ? 'oui' : 'non'); } catch (e) {} majMainsLibres(); };
+document.addEventListener('keydown', e => { if (e.code === 'Space' && document.activeElement.tagName !== 'INPUT') { e.preventDefault(); $('reacteur').click(); } });
+$('formulaire').onsubmit = e => { e.preventDefault(); const t = $('texte'); if (t.value.trim()) { envoyer({ t: 'texte', v: t.value.trim() }); t.value = ''; } };
+
+async function recap() {
+  try { const r = await fetch('/recap', { method: 'POST', headers: { 'X-Jarvis': '1', 'Content-Type': 'application/json' }, body: JSON.stringify({ pc: true }) });
+    const d = await r.json(); if (d.reponse) bulle('📋 ' + d.reponse, 'jarvis'); } catch (e) {}
+}
+majMainsLibres(); connecter(); recap();
 </script></body></html>
 """
 
@@ -2035,6 +2261,233 @@ async def tts_base64(text: str) -> str | None:
     except Exception as exc:  # noqa: BLE001
         print(f"Voix (page) indisponible, le navigateur parlera à la place : {exc}", flush=True)
         return None
+
+
+class SessionMicro:
+    """Une page Jarvis connectée : reçoit le micro (webm), détecte « Hey Jarvis », enregistre la phrase,
+    puis répond à voix haute sur l'ordinateur."""
+
+    TRAME = 1280  # 80 ms à 16 kHz
+
+    def __init__(self, ws):
+        self.ws = ws
+        self.mains_libres = True
+        self.mode = "veille"  # veille → capture → traitement (→ suivi)
+        self.ffmpeg = None
+        self.lecteur = None
+        self.wake = None
+        self.audio = bytearray()
+        self.parle = False
+        self.t_debut = 0.0
+        self.t_dernier_son = 0.0
+        self.t_parole = 0.0
+        self.fond = 300.0
+        self.cooldown = 0.0
+        self.wake_pause = 0.0
+        self.taches: set = set()
+
+    # --- flux audio ---
+    async def demarrer_flux(self) -> None:
+        await self.arreter_flux()
+        self.ffmpeg = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-nostdin", "-loglevel", "error", "-fflags", "nobuffer", "-probesize", "4096",
+            "-analyzeduration", "0", "-i", "pipe:0", "-f", "s16le", "-ac", "1", "-ar", "16000", "pipe:1",
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        self.lecteur = asyncio.create_task(self.lire_pcm(self.ffmpeg))
+
+    async def arreter_flux(self) -> None:
+        if self.ffmpeg:
+            try:
+                self.ffmpeg.stdin.close()
+                self.ffmpeg.kill()
+            except Exception:  # noqa: BLE001
+                pass
+        if self.lecteur:
+            self.lecteur.cancel()
+        self.ffmpeg = self.lecteur = None
+
+    async def recevoir_audio(self, data: bytes) -> None:
+        if self.ffmpeg is None or self.ffmpeg.returncode is not None:
+            return
+        try:
+            self.ffmpeg.stdin.write(data)
+            await self.ffmpeg.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    async def lire_pcm(self, proc) -> None:
+        import numpy as np
+
+        reste = b""
+        n = 0
+        while True:
+            bloc = await proc.stdout.read(self.TRAME * 2 * 4)
+            if not bloc:
+                return
+            reste += bloc
+            while len(reste) >= self.TRAME * 2:
+                trame, reste = reste[:self.TRAME * 2], reste[self.TRAME * 2:]
+                x = np.frombuffer(trame, dtype=np.int16)
+                rms = float(np.sqrt(np.mean(x.astype(np.float32) ** 2)))
+                n += 1
+                if n % 2 == 0:
+                    await self.envoyer({"t": "niveau", "v": round(min(1.0, rms / 6000), 3)})
+                await self.trame(x, rms)
+
+    # --- logique ---
+    async def trame(self, x, rms: float) -> None:
+        now = time.time()
+        if self.mode in ("veille", "suivi"):
+            self.fond = rms if rms < self.fond else self.fond * 0.995 + rms * 0.005
+        if self.mains_libres:
+            if self.wake is None:
+                self.wake = await asyncio.to_thread(charger_mot_reveil)
+            if self.wake is not False:
+                # On analyse toujours le son (le détecteur garde ainsi un historique à jour),
+                # mais on ne réagit qu'en veille, en suivi, ou pour couper Jarvis quand il parle.
+                score = max(self.wake.predict(x).values())
+                peut = self.mode in ("veille", "suivi") or (self.mode == "traitement" and _etat["v"] == "parle")
+                if score > 0.5 and peut and now > self.wake_pause:
+                    self.wake_pause = now + 2.5
+                    stop_pc_voice()
+                    for t in list(self.taches):
+                        t.cancel()
+                    await self.commencer_capture(bip=True)
+                    return
+        if self.mode == "suivi" and now > self.cooldown:
+            self.mode = "veille"
+            await changer_etat("repos")
+        if self.mode in ("capture", "suivi"):
+            seuil = max(600.0, self.fond * 3)
+            if self.mode == "suivi":
+                if rms > seuil * 1.3:
+                    self.mode = "capture"
+                    self.audio = bytearray()
+                    self.parle, self.t_debut = False, now
+                    await changer_etat("ecoute")
+                else:
+                    return
+            self.audio += x.tobytes()
+            if rms > seuil:
+                if not self.parle:
+                    self.parle, self.t_parole = True, now
+                self.t_dernier_son = now
+            fin_phrase = self.parle and now - self.t_dernier_son > 1.2 and now - self.t_parole > 0.4
+            trop_long = now - self.t_debut > 25
+            rien = not self.parle and now - self.t_debut > 7
+            if rien:
+                self.mode = "veille"
+                await changer_etat("repos")
+            elif fin_phrase or trop_long:
+                self.mode = "traitement"
+                await self.lancer(self.traiter_audio(bytes(self.audio)))
+
+    async def commencer_capture(self, bip: bool = False) -> None:
+        self.mode = "capture"
+        self.audio = bytearray()
+        self.parle, self.t_debut = False, time.time()
+        await changer_etat("ecoute")
+        await self.envoyer({"t": "reveil"})
+        if bip:
+            await self.lancer(speak_on_pc("<bip>", wait=True))
+
+    async def traiter_audio(self, pcm: bytes) -> None:
+        import wave
+
+        await changer_etat("pense")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "phrase.wav")
+            with wave.open(path, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(16000)
+                w.writeframes(pcm)
+            question = await asyncio.to_thread(transcribe, path)
+        if not question:
+            await diffuser({"t": "jarvis", "texte": "Je n'ai pas compris, pouvez-vous répéter ?"})
+            await speak_on_pc("Je n'ai pas compris, pouvez-vous répéter ?", wait=True)
+            await self.apres_reponse()
+            return
+        await self.traiter_texte(question)
+
+    async def traiter_texte(self, question: str) -> None:
+        self.mode = "traitement"
+        await diffuser({"t": "moi", "texte": question})
+        await changer_etat("pense")
+        try:
+            r = intention(question)
+            if r is not None:
+                await diffuser({"t": "jarvis", "texte": r})
+                if not MOTS_STOP.match(question):
+                    await speak_on_pc(r, wait=True)
+            else:
+                await dire_phrases(ask_jarvis_stream(conversation_id(), question))
+        except Exception as exc:  # noqa: BLE001
+            msg = f"L'IA ne répond pas ({exc})."
+            await diffuser({"t": "erreur", "texte": msg})
+        await self.apres_reponse()
+
+    async def apres_reponse(self) -> None:
+        # Après une réponse, on écoute encore quelques secondes sans « Hey Jarvis » (conversation naturelle).
+        if self.mains_libres:
+            self.mode, self.cooldown = "suivi", time.time() + 6
+            await changer_etat("suivi")
+        else:
+            self.mode = "veille"
+            await changer_etat("repos")
+
+    # --- messages de la page ---
+    async def commande(self, msg: dict) -> None:
+        t = msg.get("t")
+        if t == "ecoute":
+            stop_pc_voice()
+            await self.commencer_capture(bip=False)
+        elif t == "stop":
+            stop_pc_voice()
+            self.mode = "veille"
+            await changer_etat("repos")
+        elif t == "texte" and str(msg.get("v", "")).strip():
+            stop_pc_voice()
+            await self.lancer(self.traiter_texte(str(msg["v"]).strip()[:2000]))
+        elif t == "mains_libres":
+            self.mains_libres = bool(msg.get("v"))
+        elif t == "flux":
+            await self.demarrer_flux()
+
+    async def envoyer(self, msg: dict) -> None:
+        try:
+            await self.ws.send_json(msg)
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def lancer(self, coro) -> None:
+        t = asyncio.create_task(coro)
+        self.taches.add(t)
+        t.add_done_callback(self.taches.discard)
+
+
+_mot_reveil: dict = {}
+
+
+def charger_mot_reveil():
+    """Modèle « Hey Jarvis » (openWakeWord), un par page. False s'il n'est pas installé."""
+    if _mot_reveil.get("absent"):
+        return False
+    try:
+        import warnings
+
+        warnings.filterwarnings("ignore", module="onnxruntime")
+        import openwakeword
+
+        m = openwakeword.Model(wakeword_model_paths=[openwakeword.models["hey_jarvis"]["model_path"]])
+        if not _mot_reveil.get("annonce"):
+            print("👂 « Hey Jarvis » prêt.", flush=True)
+            _mot_reveil["annonce"] = True
+        return m
+    except Exception as exc:  # noqa: BLE001
+        print(f"« Hey Jarvis » indisponible ({exc}). Installe-le : uv pip install openwakeword", flush=True)
+        _mot_reveil["absent"] = True
+        return False
 
 
 def build_web_app():
@@ -2106,8 +2559,28 @@ def build_web_app():
         stop_pc_voice()
         return web.json_response({"ok": True})
 
+    async def ws_handler(request):
+        ws = web.WebSocketResponse(heartbeat=30, max_msg_size=8 * 1024 * 1024)
+        await ws.prepare(request)
+        HUB.add(ws)
+        session = SessionMicro(ws)
+        await ws.send_json({"t": "etat", "v": _etat["v"]})
+        try:
+            async for msg in ws:
+                if msg.type == web.WSMsgType.BINARY:
+                    await session.recevoir_audio(msg.data)
+                elif msg.type == web.WSMsgType.TEXT:
+                    try:
+                        await session.commande(json.loads(msg.data))
+                    except json.JSONDecodeError:
+                        pass
+        finally:
+            HUB.discard(ws)
+            await session.arreter_flux()
+        return ws
+
     app.add_routes([web.get("/", index), web.post("/parler", parler), web.post("/ecrire", ecrire),
-                    web.post("/recap", recap), web.post("/stop", stop)])
+                    web.post("/recap", recap), web.post("/stop", stop), web.get("/ws", ws_handler)])
     return app
 
 
@@ -2161,9 +2634,19 @@ def main() -> None:
     proc = ensure_ollama()
     tasks = []
 
+    async def prechauffer():
+        """Charge l'IA dans la carte graphique et la reconnaissance vocale dès le démarrage."""
+        try:
+            await asyncio.to_thread(whisper)
+            await llm([{"role": "user", "content": "Réponds seulement : OK."}])
+            print("⚡ IA et reconnaissance vocale prêtes.", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Préchauffage : {exc}", flush=True)
+
     async def post_init(app) -> None:
         tasks.append(asyncio.create_task(watcher(app)))
         await start_web()
+        tasks.append(asyncio.create_task(prechauffer()))
         if load_settings().get("pc_voice") and load_settings().get("son_demarrage", True):
             async def bonjour():
                 try:
@@ -2216,5 +2699,7 @@ if __name__ == "__main__":
         diagnostic()
     elif len(sys.argv) > 1 and sys.argv[1] in ("modele", "modèle", "ia"):
         choisir_modele()
+    elif len(sys.argv) > 1 and sys.argv[1] in ("accelerer", "accélérer"):
+        accelerer()
     else:
         main()

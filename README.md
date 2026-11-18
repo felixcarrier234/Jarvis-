@@ -45,7 +45,7 @@ Il lit tes courriels, connaît ton agenda, te rappelle tes rendez-vous et te fai
    sudo apt install -y ffmpeg zstd
    ~/.local/bin/uv venv ~/.jarvis-voix
    ~/.local/bin/uv pip install --python ~/.jarvis-voix/bin/python \
-     python-telegram-bot faster-whisper edge-tts httpx icalendar recurring-ical-events "av>=11,<19"
+     python-telegram-bot faster-whisper edge-tts httpx icalendar recurring-ical-events "av>=11,<19" ddgs "openwakeword==0.4.0"
    cp jarvis_voix.py ~/
    ```
 4. Courriel + agenda : `~/.jarvis-voix/bin/python ~/jarvis_voix.py reglages`
@@ -54,6 +54,8 @@ Il lit tes courriels, connaît ton agenda, te rappelle tes rendez-vous et te fai
 5. Démarrage automatique avec Windows : `./demarrage-auto.sh` (retirer : `./demarrage-auto.sh retirer`).
 
 ### Utilisation
+- **Interface « HUD »** (http://localhost:8765) : dites **« Hey Jarvis »** (prononcé à l'anglaise), cliquez sur le réacteur ou appuyez sur Espace. Il répond phrase par phrase sur les haut-parleurs, réécoute 6 s pour la suite, et « Hey Jarvis » le coupe quand il parle. Nécessite `openwakeword==0.4.0`.
+- **Reconnaissance vocale sur la carte NVIDIA** : `~/.jarvis-voix/bin/python ~/jarvis_voix.py accelerer`.
 - **Mémoire** : « Souviens-toi que … », « Oublie ce que je t'ai dit sur … », « Qu'est-ce que tu sais sur moi ? » (`/memoire`). Les anniversaires dictés (« l'anniversaire de Julie est le 21 novembre ») sont rappelés le jour même.
 - **Listes** : « Ajoute du lait et des œufs à l'épicerie », « J'ai acheté le lait », « Qu'est-ce qu'il y a sur ma liste ? », « Ajoute appeler le garage à mes tâches » (`/liste`, `/epicerie`, `/taches`).
 - **Automatique** : tri des courriels (pubs ignorées), alertes météo la veille (neige, grand froid, verglas, vent), résumé du soir, résultat du Canadien dès la fin du match (`/canadiens`).
