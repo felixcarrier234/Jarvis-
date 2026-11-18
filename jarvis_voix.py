@@ -14,6 +14,7 @@
 Usage :
     python jarvis_voix.py            # lance l'assistant
     python jarvis_voix.py reglages   # configure courriel / agenda / rappels
+    python jarvis_voix.py voix       # écouter et choisir la voix de Jarvis
 
 Parle directement à Ollama (le moteur d'IA local installé avec OpenJarvis).
 Lit le token Telegram, ton Id et le modèle dans ~/.openjarvis/config.toml,
@@ -50,6 +51,17 @@ OLLAMA = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
 if not OLLAMA.startswith("http"):
     OLLAMA = "http://" + OLLAMA
 VOICE = os.environ.get("JARVIS_VOIX", "fr-FR-HenriNeural")
+EFFET_IA = ("highpass=f=90,aecho=0.8:0.6:18:0.12,equalizer=f=2800:t=q:w=1.2:g=2.5,"
+            "acompressor=threshold=-18dB:ratio=3")
+VOIX = [  # (nom, voix edge-tts, débit, hauteur, effet IA)
+    ("Majordome — grave, posé, petit effet IA", "fr-FR-HenriNeural", "-8%", "-6Hz", True),
+    ("Henri — voix normale (France)", "fr-FR-HenriNeural", "+0%", "+0Hz", False),
+    ("Rémy — France, chaleureux", "fr-FR-RemyMultilingualNeural", "-4%", "-2Hz", False),
+    ("Antoine — Québec", "fr-CA-AntoineNeural", "+0%", "+0Hz", False),
+    ("Jean — Québec", "fr-CA-JeanNeural", "+0%", "+0Hz", False),
+    ("Thierry — Québec", "fr-CA-ThierryNeural", "+0%", "+0Hz", False),
+    ("Gérard — Belgique", "fr-BE-GerardNeural", "+0%", "+0Hz", False),
+]
 WHISPER_MODEL = os.environ.get("JARVIS_WHISPER", "small")
 WEB_HOST = os.environ.get("JARVIS_HOST", "127.0.0.1")
 WEB_PORT = int(os.environ.get("JARVIS_PORT", "8765"))
@@ -99,6 +111,41 @@ def ask(prompt: str, default: str = "") -> str:
     suffix = f" [{default}]" if default else ""
     val = input(f"{prompt}{suffix} : ").strip()
     return val or default
+
+
+def choisir_voix() -> None:
+    """Fait écouter chaque voix sur l'ordinateur, puis enregistre celle choisie."""
+    s = load_settings()
+    phrase = "Bonjour Monsieur. Tous les systèmes sont opérationnels. Que puis-je faire pour vous ?"
+    print("\n=== Choix de la voix de Jarvis ===\nÉcoute bien tes haut-parleurs…\n")
+    for i, (nom, voix, rate, pitch, effet) in enumerate(VOIX, 1):
+        print(f"  {i}. {nom}", flush=True)
+        essai = {**s, "voice": voix, "voice_rate": rate, "voice_pitch": pitch, "voice_effect": effet}
+        try:
+            asyncio.run(speak_on_pc(phrase, wait=True, s=essai))
+        except Exception as exc:  # noqa: BLE001
+            print(f"     (impossible de jouer cette voix : {exc})")
+        time.sleep(0.4)
+    actuel = next((str(i) for i, v in enumerate(VOIX, 1)
+                   if v[1] == s.get("voice") and v[2] == s.get("voice_rate", "+0%")), "1")
+    while True:
+        rep = ask(f"\nQuelle voix veux-tu ? (1 à {len(VOIX)}, « r » pour réécouter)", actuel)
+        if rep.lower() == "r":
+            return choisir_voix()
+        if rep.isdigit() and 1 <= int(rep) <= len(VOIX):
+            break
+    nom, voix, rate, pitch, effet = VOIX[int(rep) - 1]
+    s.update(voice=voix, voice_rate=rate, voice_pitch=pitch, voice_effect=effet)
+    s["majordome"] = ask("Personnalité « majordome » (il te vouvoie et t'appelle Monsieur) ? (o/n)",
+                         "o" if s.get("majordome", int(rep) == 1) else "n").lower().startswith("o")
+    save_settings(s)
+    print(f"\n✅ Voix choisie : {nom}.")
+    try:
+        asyncio.run(speak_on_pc("Parfait. C'est désormais ma voix." if not s["majordome"]
+                                else "Très bien, Monsieur. Ce sera désormais ma voix.", wait=True, s=s))
+    except Exception:  # noqa: BLE001
+        pass
+    print("Redémarre Jarvis pour l'appliquer partout :  pkill -f jarvis_voix.py")
 
 
 def reglages() -> None:
@@ -593,6 +640,9 @@ def system_prompt(extra: str = "") -> str:
         f"Nous sommes {JOURS[now.weekday()]} {now.day} {MOIS[now.month - 1]} {now.year}, "
         f"il est {fmt_hour(now)}."
     )
+    if load_settings().get("majordome"):
+        base += (" Tu t'exprimes comme un majordome britannique distingué, posé et pince-sans-rire : "
+                 "tu vouvoies l'utilisateur et l'appelles « Monsieur », avec une pointe d'humour discret.")
     if extra:
         base += "\n\n" + extra
     return base
@@ -714,36 +764,39 @@ def transcribe(path: str) -> str:
     return " ".join(seg.text.strip() for seg in segments).strip()
 
 
-async def speak(text: str, workdir: str) -> str:
+async def synth(text: str, out: str, s: dict | None = None) -> str:
+    """Synthèse vocale avec la voix choisie (réglages), vers out (.ogg, .wav ou .mp3)."""
     import edge_tts
 
-    mp3 = os.path.join(workdir, "reponse.mp3")
-    ogg = os.path.join(workdir, "reponse.ogg")
-    await edge_tts.Communicate(text, VOICE).save(mp3)
-    await asyncio.to_thread(
-        subprocess.run,
-        ["ffmpeg", "-y", "-loglevel", "error", "-i", mp3, "-c:a", "libopus", "-b:a", "48k", ogg],
-        check=True,
-    )
-    return ogg
+    s = load_settings() if s is None else s
+    voix = s.get("voice") or VOICE
+    with tempfile.TemporaryDirectory() as tmp:
+        mp3 = os.path.join(tmp, "brut.mp3")
+        await edge_tts.Communicate(text, voix, rate=s.get("voice_rate", "+0%"),
+                                   pitch=s.get("voice_pitch", "+0Hz")).save(mp3)
+        cmd = ["ffmpeg", "-nostdin", "-y", "-loglevel", "error", "-i", mp3]
+        if s.get("voice_effect"):
+            cmd += ["-af", EFFET_IA]
+        if out.endswith(".ogg"):
+            cmd += ["-c:a", "libopus", "-b:a", "48k"]
+        await asyncio.to_thread(subprocess.run, cmd + [out], check=True)
+    return out
+
+
+async def speak(text: str, workdir: str) -> str:
+    return await synth(text, os.path.join(workdir, "reponse.ogg"))
 
 
 _pc_lock = asyncio.Lock()
 _bg_tasks: set = set()
 
 
-async def speak_on_pc(text: str, wait: bool = False) -> None:
+async def speak_on_pc(text: str, wait: bool = False, s: dict | None = None) -> None:
     """Dit le texte sur les haut-parleurs de l'ordinateur (Windows via WSL, ou Linux)."""
-    import edge_tts
-
     out_dir = Path(tempfile.gettempdir()) / "jarvis-voix"
     out_dir.mkdir(exist_ok=True)
-    stamp = f"{time.time_ns()}"
-    mp3, wav = out_dir / f"{stamp}.mp3", out_dir / f"{stamp}.wav"
-    await edge_tts.Communicate(text, VOICE).save(str(mp3))
-    await asyncio.to_thread(subprocess.run, ["ffmpeg", "-y", "-loglevel", "error", "-i", str(mp3), str(wav)],
-                            check=True)
-    mp3.unlink(missing_ok=True)
+    wav = out_dir / f"{time.time_ns()}.wav"
+    await synth(text, str(wav), s)
     if shutil.which("powershell.exe"):
         win = subprocess.run(["wslpath", "-w", str(wav)], capture_output=True, text=True, check=True).stdout.strip()
         cmd = ["powershell.exe", "-NoProfile", "-Command",
@@ -758,7 +811,8 @@ async def speak_on_pc(text: str, wait: bool = False) -> None:
 
     async def play():
         async with _pc_lock:  # une phrase à la fois
-            await asyncio.to_thread(subprocess.run, cmd, cwd=cwd, capture_output=True, timeout=300)
+            await asyncio.to_thread(subprocess.run, cmd, cwd=cwd, capture_output=True, timeout=300,
+                                    stdin=subprocess.DEVNULL)
         wav.unlink(missing_ok=True)
 
     if wait:
@@ -1301,12 +1355,9 @@ chargerRecap();
 async def tts_base64(text: str) -> str | None:
     import base64
 
-    import edge_tts
-
     try:
         with tempfile.TemporaryDirectory() as tmp:
-            mp3 = os.path.join(tmp, "r.mp3")
-            await edge_tts.Communicate(text, VOICE).save(mp3)
+            mp3 = await synth(text, os.path.join(tmp, "r.mp3"))
             return base64.b64encode(Path(mp3).read_bytes()).decode()
     except Exception as exc:  # noqa: BLE001
         print(f"Voix (page) indisponible, le navigateur parlera à la place : {exc}", flush=True)
@@ -1465,5 +1516,7 @@ def main() -> None:
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] in ("reglages", "réglages", "config"):
         reglages()
+    elif len(sys.argv) > 1 and sys.argv[1] == "voix":
+        choisir_voix()
     else:
         main()
