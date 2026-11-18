@@ -5,6 +5,9 @@
 - Il connaît ton agenda (Google Agenda via l'adresse secrète iCal).
 - Il te rappelle tes rendez-vous avant qu'ils commencent, t'annonce les
   nouveaux courriels et te fait un résumé de ta journée le matin.
+- Rappels perso (« rappelle-moi demain à 9 h d'appeler maman »), météo,
+  nouvelles, recherche sur Internet, et il peut parler sur les haut-parleurs
+  de l'ordinateur.
 
 Usage :
     python jarvis_voix.py            # lance l'assistant
@@ -50,6 +53,18 @@ WHISPER_MODEL = os.environ.get("JARVIS_WHISPER", "small")
 JOURS = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
 MOIS = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août",
         "septembre", "octobre", "novembre", "décembre"]
+
+REMINDERS = HOME / "rappels.json"
+NEWS_DEFAULT = "https://ici.radio-canada.ca/rss/4159"
+
+MOTS_METEO = re.compile(r"météo|meteo|température|temperature|pleuvoir|pluie|neige|neiger|froid|chaud|"
+                        r"parapluie|manteau|temps qu.il (fait|va faire)|degrés|degres|soleil|orage|vent", re.I)
+MOTS_NOUVELLES = re.compile(r"nouvelles|actualit|news|journal|qu.est-ce qui se passe", re.I)
+MOTS_WEB = re.compile(r"cherche|recherche|internet|sur le web|google|trouve-moi|résultat|resultat|score|"
+                      r"qui a gagné|qui a gagne|combien co[uû]te|prix d|horaire d|ouvert|dernière|derniere|récent|recent", re.I)
+MOTS_RAPPEL = re.compile(r"\b(rappelle[- ]?moi|rapelle[- ]?moi|fais[- ]moi penser|fait[- ]moi penser|"
+                         r"n.oublie pas de me rappeler|mets?[- ]moi un rappel|mets? un rappel|ajoute un rappel|"
+                         r"crée un rappel|cree un rappel)\b[,:]?", re.I)
 
 MOTS_COURRIEL = re.compile(r"courriel|e-?mail|mail|message|boîte|boite|inbox|reçu", re.I)
 MOTS_AGENDA = re.compile(
@@ -112,6 +127,29 @@ def reglages() -> None:
 
     s["morning"] = ask("\n3) Heure du résumé du matin (ex. 07:30, vide = jamais)", s.get("morning", "07:30"))
 
+    ville = ask("\n4) MÉTÉO — ta ville (ex. Montréal, Québec, Sherbrooke ; vide = pas de météo)",
+                s.get("city", ""))
+    if ville and (ville != s.get("city") or "lat" not in s):
+        try:
+            g = geocode(ville)
+            s.update(city=ville, lat=g["latitude"], lon=g["longitude"],
+                     city_label=f"{g['name']}, {g.get('admin1', '')}".strip(", "))
+            print(f"   → {s['city_label']}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"   ❌ Ville introuvable ({exc}), météo désactivée.")
+            s.pop("lat", None)
+    elif not ville:
+        for k in ("city", "lat", "lon", "city_label"):
+            s.pop(k, None)
+
+    s["news_url"] = ask("\n5) NOUVELLES — adresse du fil RSS (Entrée = Radio-Canada, « non » = pas de nouvelles)",
+                        s.get("news_url", NEWS_DEFAULT))
+    if s["news_url"].lower() in ("non", "n", "aucun"):
+        s["news_url"] = ""
+
+    s["pc_voice"] = ask("\n6) Parler aussi à voix haute sur l'ordinateur ? (o/n)",
+                        "o" if s.get("pc_voice", True) else "n").lower().startswith("o")
+
     save_settings(s)
     print(f"\nRéglages enregistrés dans {SETTINGS}\n\nTest des connexions…")
     if s.get("email"):
@@ -132,7 +170,24 @@ def reglages() -> None:
         except Exception as exc:  # noqa: BLE001
             print(f"  ❌ Agenda : {exc}")
             print("     Vérifie que tu as copié l'adresse SECRÈTE au format iCal.")
-    print("\nLance maintenant :  ~/.jarvis-voix/bin/python ~/jarvis_voix.py")
+    if s.get("lat"):
+        try:
+            print(f"  ✅ Météo OK : {weather_text(s).splitlines()[1]}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  ❌ Météo : {exc}")
+    if s.get("news_url"):
+        try:
+            print(f"  ✅ Nouvelles OK : {fetch_news(s, 1)[0]}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  ❌ Nouvelles : {exc}")
+    if s.get("pc_voice"):
+        print("  🔊 Test de la voix sur l'ordinateur…")
+        try:
+            asyncio.run(speak_on_pc("Bonjour, je suis Jarvis. Tu m'entends bien ?", wait=True))
+            print("  ✅ Si tu as entendu la voix, c'est bon.")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  ❌ Voix sur l'ordinateur : {exc}")
+    print("\nRelance Jarvis :  pkill -f jarvis_voix.py   (il redémarre tout seul en 15 s)")
 
 
 # ---------------------------------------------------------------------------
@@ -306,6 +361,197 @@ def events_text(evs: list[dict]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Météo (Open-Meteo, gratuit, sans clé)
+# ---------------------------------------------------------------------------
+
+METEO_CODES = {
+    0: "ciel dégagé", 1: "plutôt dégagé", 2: "partiellement nuageux", 3: "couvert",
+    45: "brouillard", 48: "brouillard givrant", 51: "bruine légère", 53: "bruine", 55: "bruine forte",
+    56: "bruine verglaçante", 57: "bruine verglaçante", 61: "pluie faible", 63: "pluie", 65: "forte pluie",
+    66: "pluie verglaçante", 67: "forte pluie verglaçante", 71: "neige faible", 73: "neige",
+    75: "forte neige", 77: "grésil", 80: "averses", 81: "averses", 82: "fortes averses",
+    85: "averses de neige", 86: "fortes averses de neige", 95: "orages", 96: "orages avec grêle",
+    99: "orages avec grêle",
+}
+
+
+def geocode(city: str) -> dict:
+    r = httpx.get("https://geocoding-api.open-meteo.com/v1/search",
+                  params={"name": city, "count": 1, "language": "fr"}, timeout=20)
+    r.raise_for_status()
+    res = r.json().get("results") or []
+    if not res:
+        raise RuntimeError("aucun résultat")
+    return res[0]
+
+
+def weather_text(s: dict) -> str:
+    r = httpx.get("https://api.open-meteo.com/v1/forecast", timeout=20, params={
+        "latitude": s["lat"], "longitude": s["lon"], "timezone": "auto", "forecast_days": 3,
+        "current": "temperature_2m,apparent_temperature,weather_code,wind_speed_10m",
+        "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max",
+    })
+    r.raise_for_status()
+    d = r.json()
+    c = d["current"]
+    lines = [f"MÉTÉO à {s.get('city_label') or s.get('city')} :",
+             f"Maintenant : {round(c['temperature_2m'])} °C (ressenti {round(c['apparent_temperature'])} °C), "
+             f"{METEO_CODES.get(c['weather_code'], 'temps variable')}, vent {round(c['wind_speed_10m'])} km/h."]
+    dd = d["daily"]
+    for i, jour in enumerate(dd["time"]):
+        nom = ["Aujourd'hui", "Demain", "Après-demain"][i] if i < 3 else jour
+        pluie = dd["precipitation_probability_max"][i]
+        lines.append(f"{nom} : {METEO_CODES.get(dd['weather_code'][i], 'variable')}, "
+                     f"min {round(dd['temperature_2m_min'][i])} °C, max {round(dd['temperature_2m_max'][i])} °C"
+                     + (f", {pluie} % de risque de précipitations." if pluie is not None else "."))
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Nouvelles (fil RSS) et recherche Internet (DuckDuckGo)
+# ---------------------------------------------------------------------------
+
+def fetch_news(s: dict, limit: int = 6) -> list[str]:
+    import xml.etree.ElementTree as ET
+
+    r = httpx.get(s.get("news_url") or NEWS_DEFAULT, timeout=20, follow_redirects=True,
+                  headers={"User-Agent": "Mozilla/5.0 (JarvisVoix)"})
+    r.raise_for_status()
+    root = ET.fromstring(r.content)
+    titres = []
+    for item in root.iter():
+        if item.tag.split("}")[-1] in ("item", "entry"):
+            t = next((c.text for c in item if c.tag.split("}")[-1] == "title" and c.text), None)
+            if t:
+                titres.append(re.sub(r"\s+", " ", t).strip())
+        if len(titres) >= limit:
+            break
+    if not titres:
+        raise RuntimeError("fil vide")
+    return titres
+
+
+def web_search(query: str, limit: int = 5) -> str:
+    from ddgs import DDGS
+
+    res = DDGS().text(query, region="ca-fr", max_results=limit) or []
+    lines = [f"- {r.get('title', '')} : {r.get('body', '')[:300]} ({r.get('href', '')})" for r in res]
+    return "\n".join(lines) or "(aucun résultat)"
+
+
+# ---------------------------------------------------------------------------
+# Rappels perso (« rappelle-moi demain à 9 h d'appeler maman »)
+# ---------------------------------------------------------------------------
+
+NOMBRES = {"un": 1, "une": 1, "deux": 2, "trois": 3, "quatre": 4, "cinq": 5, "six": 6, "sept": 7,
+           "huit": 8, "neuf": 9, "dix": 10, "quinze": 15, "vingt": 20, "trente": 30, "quarante": 40,
+           "quarante-cinq": 45, "cinquante": 50, "soixante": 60}
+JOURS_RE = "|".join(JOURS)
+MOIS_RE = "|".join(MOIS + ["fevrier", "aout", "decembre"])
+
+
+def _num(x: str) -> int:
+    return int(x) if x.isdigit() else NOMBRES[x.lower()]
+
+
+def parse_rappel(text: str, now: datetime | None = None):
+    """Retourne (date/heure, quoi) ou None si on ne trouve pas quand."""
+    now = now or datetime.now().astimezone()
+    t = MOTS_RAPPEL.sub(" ", text)
+    spans: list[tuple[int, int]] = []
+    when = None
+    day = None
+    hour = None
+    default_hour = 9
+
+    def take(m):
+        spans.append(m.span())
+
+    nb = r"(\d+|une?|deux|trois|quatre|cinq|six|sept|huit|neuf|dix|quinze|vingt|trente|quarante(?:-cinq)?|cinquante|soixante)"
+    m = re.search(rf"\bdans\s+{nb}\s*(minutes?|mins?|heures?|h|jours?)\b(\s+et\s+demie?)?", t, re.I)
+    if m:
+        take(m)
+        n = _num(m.group(1))
+        unit = m.group(2).lower()
+        if unit.startswith("min"):
+            when = now + timedelta(minutes=n)
+        elif unit.startswith("h"):
+            when = now + timedelta(hours=n, minutes=30 if m.group(3) else 0)
+        else:
+            day = (now + timedelta(days=n)).date()
+    if when is None and (m := re.search(r"\bdans\s+une?\s+demi-?heure\b", t, re.I)):
+        take(m)
+        when = now + timedelta(minutes=30)
+
+    if when is None:
+        if m := re.search(r"\bapr[eè]s[- ]demain\b", t, re.I):
+            take(m); day = (now + timedelta(days=2)).date()
+        elif m := re.search(r"\bdemain(\s+matin|\s+soir|\s+apr[eè]s[- ]midi)?\b", t, re.I):
+            take(m); day = (now + timedelta(days=1)).date()
+            part = (m.group(1) or "").strip().lower()
+            default_hour = 19 if part == "soir" else 14 if part.startswith("apr") else 9
+        elif m := re.search(r"\b(ce soir|ce matin|cet apr[eè]s[- ]midi|aujourd.hui|tant[oô]t)\b", t, re.I):
+            take(m); day = now.date()
+            w = m.group(1).lower()
+            default_hour = 19 if "soir" in w else 14 if "apr" in w else 9 if "matin" in w else now.hour + 1
+        elif m := re.search(rf"\b(?:le\s+)?(\d{{1,2}})(?:er)?\s+({MOIS_RE})\b", t, re.I):
+            take(m)
+            mois = m.group(2).lower().replace("fevrier", "février").replace("aout", "août").replace("decembre", "décembre")
+            mo = MOIS.index(mois) + 1
+            y = now.year + (1 if (mo, int(m.group(1))) < (now.month, now.day) else 0)
+            day = date(y, mo, int(m.group(1)))
+        elif m := re.search(rf"\b({JOURS_RE})(\s+prochain)?(\s+(matin|soir|apr[eè]s[- ]midi))?\b", t, re.I):
+            take(m)
+            target = JOURS.index(m.group(1).lower())
+            delta = (target - now.weekday()) % 7 or 7
+            day = (now + timedelta(days=delta)).date()
+            part = (m.group(4) or "").lower()
+            default_hour = 19 if part == "soir" else 14 if part.startswith("apr") else 9
+
+        if m := re.search(r"\b(?:à|a|vers|pour)?\s*(\d{1,2})\s*(?:h|heures?|:)\s*(\d{2})?(?!\d)", t, re.I):
+            take(m); hour = (int(m.group(1)), int(m.group(2) or 0))
+        elif m := re.search(r"\b(?:à|a|vers)?\s*(midi|minuit)(\s+et\s+demie)?\b", t, re.I):
+            take(m); hour = (12 if m.group(1).lower() == "midi" else 0, 30 if m.group(2) else 0)
+
+        if day is None and hour is None:
+            return None
+        if day is None:
+            day = now.date()
+        h, mi = hour if hour else (min(default_hour, 23), 0)
+        if hour and h < 12 and re.search(r"\b(soir|apr[eè]s[- ]midi)\b", t, re.I):
+            h += 12
+        when = datetime(day.year, day.month, day.day, h, mi).astimezone()
+        if when <= now and hour and day == now.date():
+            when += timedelta(days=1)
+
+    quoi = t
+    for a, b in sorted(spans, reverse=True):
+        quoi = quoi[:a] + " " + quoi[b:]
+    quoi = re.sub(r"\s+", " ", quoi).strip(" ,.!?;:")
+    quoi = re.sub(r"^(de |d'|d’|qu'|qu’|que |pour |s'il te pla[iî]t,? )", "", quoi, flags=re.I).strip()
+    quoi = re.sub(r"\s*,?\s*s'il te pla[iî]t$", "", quoi, flags=re.I).strip(" ,.")
+    return when, quoi or "ton rappel"
+
+
+def load_reminders() -> list[dict]:
+    try:
+        return json.loads(REMINDERS.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def save_reminders(items: list[dict]) -> None:
+    REMINDERS.write_text(json.dumps(items, indent=2, ensure_ascii=False))
+
+
+def add_reminder(when: datetime, what: str) -> None:
+    items = load_reminders()
+    items.append({"when": when.isoformat(), "what": what})
+    items.sort(key=lambda r: r["when"])
+    save_reminders(items)
+
+
+# ---------------------------------------------------------------------------
 # Jarvis (IA locale via Ollama)
 # ---------------------------------------------------------------------------
 
@@ -324,8 +570,9 @@ def system_prompt(extra: str = "") -> str:
         "Tu es Jarvis, l'assistant personnel de l'utilisateur. Tu réponds toujours en français, "
         "de façon naturelle, chaleureuse et assez courte (2 à 5 phrases), car ta réponse sera lue "
         "à voix haute. N'utilise pas de listes, d'emojis ni de mise en forme. "
-        "Tu as accès à l'agenda et aux courriels de l'utilisateur : quand c'est utile, ils te sont "
-        "fournis dans son message. Ne dis jamais que tu n'as pas accès à ses comptes. "
+        "Tu as accès à l'agenda, aux courriels, à la météo, aux nouvelles et à Internet : quand c'est "
+        "utile, ces informations te sont fournies dans son message. Ne dis jamais que tu n'y as pas "
+        "accès. Tu peux aussi créer des rappels : l'utilisateur doit dire « rappelle-moi … ». "
         f"Nous sommes {JOURS[now.weekday()]} {now.day} {MOIS[now.month - 1]} {now.year}, "
         f"il est {fmt_hour(now)}."
     )
@@ -385,6 +632,23 @@ async def gather_context(question: str, s: dict) -> str:
             parts.append("AGENDA (7 prochains jours) :\n" + events_text(evs))
         except Exception as exc:  # noqa: BLE001
             parts.append(f"AGENDA : impossible de le lire ({exc}).")
+    if s.get("lat") and MOTS_METEO.search(question):
+        try:
+            parts.append(await asyncio.to_thread(weather_text, s))
+        except Exception as exc:  # noqa: BLE001
+            parts.append(f"MÉTÉO : impossible de la lire ({exc}).")
+    if s.get("news_url") and MOTS_NOUVELLES.search(question):
+        try:
+            titres = await asyncio.to_thread(fetch_news, s, 8)
+            parts.append("NOUVELLES DU JOUR (titres) :\n" + "\n".join(f"- {t}" for t in titres))
+        except Exception as exc:  # noqa: BLE001
+            parts.append(f"NOUVELLES : impossibles à lire ({exc}).")
+    if MOTS_WEB.search(question):
+        try:
+            parts.append(f"RÉSULTATS DE RECHERCHE INTERNET pour « {question} » :\n"
+                         + await asyncio.to_thread(web_search, question))
+        except Exception as exc:  # noqa: BLE001
+            parts.append(f"INTERNET : recherche impossible ({exc}).")
     if s.get("email") and MOTS_COURRIEL.search(question):
         try:
             mails = await asyncio.to_thread(fetch_emails, s, 8)
@@ -447,12 +711,58 @@ async def speak(text: str, workdir: str) -> str:
     return ogg
 
 
+_pc_lock = asyncio.Lock()
+_bg_tasks: set = set()
+
+
+async def speak_on_pc(text: str, wait: bool = False) -> None:
+    """Dit le texte sur les haut-parleurs de l'ordinateur (Windows via WSL, ou Linux)."""
+    import edge_tts
+
+    out_dir = Path(tempfile.gettempdir()) / "jarvis-voix"
+    out_dir.mkdir(exist_ok=True)
+    stamp = f"{time.time_ns()}"
+    mp3, wav = out_dir / f"{stamp}.mp3", out_dir / f"{stamp}.wav"
+    await edge_tts.Communicate(text, VOICE).save(str(mp3))
+    await asyncio.to_thread(subprocess.run, ["ffmpeg", "-y", "-loglevel", "error", "-i", str(mp3), str(wav)],
+                            check=True)
+    mp3.unlink(missing_ok=True)
+    if shutil.which("powershell.exe"):
+        win = subprocess.run(["wslpath", "-w", str(wav)], capture_output=True, text=True, check=True).stdout.strip()
+        cmd = ["powershell.exe", "-NoProfile", "-Command",
+               f"(New-Object Media.SoundPlayer '{win}').PlaySync()"]
+        cwd = "/mnt/c" if os.path.isdir("/mnt/c") else None
+    elif shutil.which("paplay"):
+        cmd, cwd = ["paplay", str(wav)], None
+    elif shutil.which("aplay"):
+        cmd, cwd = ["aplay", "-q", str(wav)], None
+    else:
+        raise RuntimeError("aucun lecteur audio trouvé")
+
+    async def play():
+        async with _pc_lock:  # une phrase à la fois
+            await asyncio.to_thread(subprocess.run, cmd, cwd=cwd, capture_output=True, timeout=300)
+        wav.unlink(missing_ok=True)
+
+    if wait:
+        await play()
+    else:
+        task = asyncio.create_task(play())
+        _bg_tasks.add(task)
+        task.add_done_callback(_bg_tasks.discard)
+
+
 async def say(bot, chat_id: int | str, text: str, reply_to=None) -> None:
-    """Envoie le texte puis la même chose en message vocal."""
+    """Envoie le texte, la même chose en message vocal, et le dit sur l'ordinateur si activé."""
     if reply_to is not None:
         await reply_to.reply_text(text)
     else:
         await bot.send_message(chat_id, text)
+    if load_settings().get("pc_voice"):
+        try:
+            await speak_on_pc(text)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Voix sur l'ordinateur indisponible : {exc}", flush=True)
     try:
         await bot.send_chat_action(chat_id, "record_voice")
         with tempfile.TemporaryDirectory() as tmp:
@@ -486,6 +796,18 @@ async def on_message(update, context) -> None:
         await msg.reply_text(f"🎤 « {question} »")
     else:
         question = msg.text or ""
+
+    if MOTS_RAPPEL.search(question):
+        parsed = parse_rappel(question)
+        if parsed is None:
+            await say(context.bot, chat_id, "Je veux bien, mais pour quand ? Dis par exemple : "
+                      "rappelle-moi demain à 9 h d'appeler maman.", reply_to=msg)
+        else:
+            when, what = parsed
+            add_reminder(when, what)
+            await say(context.bot, chat_id, f"C'est noté : je te rappellerai {fmt_when(when)} : {what}.",
+                      reply_to=msg)
+        return
 
     try:
         answer = await ask_jarvis(chat_id, question)
@@ -537,14 +859,96 @@ async def cmd_agenda(update, context) -> None:
     await say(context.bot, chat_id, "Tes prochains rendez-vous : " + " ; ".join(describe_event(e) for e in evs[:10]) + ".")
 
 
+def _allowed(update) -> bool:
+    return not ALLOWED or str(update.effective_chat.id) in ALLOWED
+
+
+async def cmd_rappels(update, context) -> None:
+    if not _allowed(update):
+        return
+    items = load_reminders()
+    if not items:
+        await update.effective_message.reply_text("Aucun rappel prévu. Dis-moi « rappelle-moi … » pour en créer un.")
+        return
+    lignes = [f"{i}. {fmt_when(datetime.fromisoformat(r['when']))} : {r['what']}" for i, r in enumerate(items, 1)]
+    await update.effective_message.reply_text("⏰ Tes rappels :\n" + "\n".join(lignes)
+                                              + "\n\nPour en effacer un : /effacer suivi du numéro (ex. /effacer 2)")
+
+
+async def cmd_effacer(update, context) -> None:
+    if not _allowed(update):
+        return
+    items = load_reminders()
+    try:
+        n = int(context.args[0])
+        r = items.pop(n - 1)
+    except (IndexError, ValueError):
+        await update.effective_message.reply_text("Écris /effacer suivi du numéro du rappel (voir /rappels).")
+        return
+    save_reminders(items)
+    await update.effective_message.reply_text(f"Rappel effacé : {r['what']}.")
+
+
+async def cmd_meteo(update, context) -> None:
+    if not _allowed(update):
+        return
+    s = load_settings()
+    if not s.get("lat"):
+        await update.effective_message.reply_text("Météo pas branchée : lance « jarvis_voix.py reglages ».")
+        return
+    try:
+        data = await asyncio.to_thread(weather_text, s)
+        text = await llm([{"role": "system", "content": system_prompt()},
+                          {"role": "user", "content": data + "\n\nRésume-moi la météo d'aujourd'hui et de demain."}])
+    except Exception as exc:  # noqa: BLE001
+        await update.effective_message.reply_text(f"Météo impossible : {exc}")
+        return
+    await say(context.bot, update.effective_chat.id, text or data)
+
+
+async def cmd_nouvelles(update, context) -> None:
+    if not _allowed(update):
+        return
+    s = load_settings()
+    try:
+        titres = await asyncio.to_thread(fetch_news, s, 5)
+    except Exception as exc:  # noqa: BLE001
+        await update.effective_message.reply_text(f"Nouvelles impossibles : {exc}")
+        return
+    await say(context.bot, update.effective_chat.id, "Les titres du moment : " + " ; ".join(titres) + ".")
+
+
+async def cmd_cherche(update, context) -> None:
+    if not _allowed(update):
+        return
+    q = " ".join(context.args)
+    if not q:
+        await update.effective_message.reply_text("Écris /cherche suivi de ta question (ex. /cherche résultat du Canadien hier).")
+        return
+    await context.bot.send_chat_action(update.effective_chat.id, "typing")
+    try:
+        res = await asyncio.to_thread(web_search, q)
+        text = await llm([{"role": "system", "content": system_prompt()},
+                          {"role": "user", "content": f"Résultats de recherche Internet :\n{res}\n\n"
+                                                      f"Réponds à ma question en t'appuyant dessus : {q}"}])
+    except Exception as exc:  # noqa: BLE001
+        await update.effective_message.reply_text(f"Recherche impossible : {exc}")
+        return
+    await say(context.bot, update.effective_chat.id, text or res)
+
+
 async def cmd_aide(update, context) -> None:
     await update.effective_message.reply_text(
         "Je suis Jarvis 🤖\n\n"
         "• Parle-moi en vocal 🎤 ou écris-moi.\n"
         "• /agenda — tes prochains rendez-vous\n"
         "• /courriels — tes derniers courriels\n"
-        "• Demande aussi : « Qu'est-ce que j'ai demain ? », « Lis-moi mes courriels »…\n\n"
-        "Je te rappelle tes rendez-vous et t'annonce tes nouveaux courriels tout seul."
+        "• /meteo — la météo\n"
+        "• /nouvelles — les titres du moment\n"
+        "• /cherche … — chercher sur Internet\n"
+        "• /rappels — tes rappels (et /effacer N)\n\n"
+        "Exemples : « Qu'est-ce que j'ai demain ? », « Lis-moi mes courriels », "
+        "« Est-ce qu'il va neiger demain ? », « Rappelle-moi dans 20 minutes de sortir le linge »."
     )
 
 
@@ -563,11 +967,25 @@ async def morning_brief(bot, chat_id: str, s: dict) -> None:
             extra.append(f"COURRIELS NON LUS ({len(mails)}) :\n" + emails_text(mails[:8]))
         except Exception as exc:  # noqa: BLE001
             extra.append(f"COURRIELS : illisibles ({exc})")
+    if s.get("lat"):
+        try:
+            extra.append(await asyncio.to_thread(weather_text, s))
+        except Exception as exc:  # noqa: BLE001
+            extra.append(f"MÉTÉO : illisible ({exc})")
+    if s.get("news_url"):
+        try:
+            extra.append("NOUVELLES :\n" + "\n".join(f"- {t}" for t in await asyncio.to_thread(fetch_news, s, 4)))
+        except Exception as exc:  # noqa: BLE001
+            extra.append(f"NOUVELLES : illisibles ({exc})")
+    today_rem = [r for r in load_reminders() if datetime.fromisoformat(r["when"]).date() == datetime.now().astimezone().date()]
+    if today_rem:
+        extra.append("RAPPELS D'AUJOURD'HUI :\n" + "\n".join(
+            f"- {fmt_hour(datetime.fromisoformat(r['when']))} : {r['what']}" for r in today_rem))
     text = await llm([
         {"role": "system", "content": system_prompt()},
         {"role": "user", "content": "Voici mes vraies données :\n\n" + "\n\n".join(extra)
-         + "\n\nFais-moi mon résumé du matin : souhaite-moi bonne journée, dis-moi mes "
-           "rendez-vous d'aujourd'hui et les courriels importants."},
+         + "\n\nFais-moi mon résumé du matin : souhaite-moi bonne journée, donne la météo, "
+           "dis-moi mes rendez-vous et rappels d'aujourd'hui, les courriels importants et 2 ou 3 nouvelles."},
     ])
     await say(bot, chat_id, text or "Bonjour ! Je n'ai rien de spécial à te signaler ce matin.")
 
@@ -602,6 +1020,16 @@ async def watcher(app) -> None:
                                   f"dans {mins} minute{'s' if mins > 1 else ''}.")
         except Exception as exc:  # noqa: BLE001
             print(f"Agenda : {exc}", flush=True)
+
+        try:
+            items = load_reminders()
+            due = [r for r in items if datetime.fromisoformat(r["when"]) <= now]
+            if due:
+                save_reminders([r for r in items if r not in due])
+                for r in due:
+                    await say(app.bot, chat_id, f"⏰ Rappel : {r['what']}.")
+        except Exception as exc:  # noqa: BLE001
+            print(f"Rappels : {exc}", flush=True)
 
         try:
             if s.get("email") and s.get("notify_new_email", True) and time.time() - last_mail_check > 180:
@@ -679,10 +1107,17 @@ def main() -> None:
         app.add_handler(CommandHandler(["start", "aide", "help"], cmd_aide))
         app.add_handler(CommandHandler(["courriels", "courriel", "mails"], cmd_courriels))
         app.add_handler(CommandHandler("agenda", cmd_agenda))
+        app.add_handler(CommandHandler("rappels", cmd_rappels))
+        app.add_handler(CommandHandler("effacer", cmd_effacer))
+        app.add_handler(CommandHandler("meteo", cmd_meteo))
+        app.add_handler(CommandHandler("nouvelles", cmd_nouvelles))
+        app.add_handler(CommandHandler("cherche", cmd_cherche))
         app.add_handler(
             MessageHandler((filters.TEXT & ~filters.COMMAND) | filters.VOICE | filters.AUDIO, on_message)
         )
-        branche = [n for n, ok in (("courriel", s.get("email")), ("agenda", s.get("ics_url"))) if ok]
+        branche = [n for n, ok in (("courriel", s.get("email")), ("agenda", s.get("ics_url")),
+                                   ("météo", s.get("lat")), ("nouvelles", s.get("news_url")),
+                                   ("voix sur l'ordi", s.get("pc_voice"))) if ok]
         print(f"✅ Jarvis Voix est prêt ({', '.join(branche) or 'sans courriel ni agenda'}). "
               "Parle-lui sur Telegram ! (Ctrl+C pour arrêter)", flush=True)
         app.run_polling()
