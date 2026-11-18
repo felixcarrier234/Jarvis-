@@ -54,6 +54,7 @@ Il lit tes courriels, connaît ton agenda, te rappelle tes rendez-vous et te fai
 5. Démarrage automatique avec Windows : `./demarrage-auto.sh` (retirer : `./demarrage-auto.sh retirer`).
 
 ### Utilisation
+- **Sur l'ordinateur, avec le micro** : ouvre http://localhost:8765 dans Edge ou Chrome, clique sur le cercle et parle (il répond à voix haute et réécoute). Astuce : dans Edge, menu ⋯ → Applications → « Installer ce site en tant qu'application » pour avoir une icône Jarvis.
 - Vocal 🎤 (bouton micro de Telegram) ou texte : « Qu'est-ce que j'ai demain ? », « Lis-moi mes courriels »…
 - Commandes : `/agenda`, `/courriels`, `/aide`.
 - Automatique : rappel avant chaque rendez-vous, annonce des nouveaux courriels, résumé du matin.

@@ -8,6 +8,8 @@
 - Rappels perso (« rappelle-moi demain à 9 h d'appeler maman »), météo,
   nouvelles, recherche sur Internet, et il peut parler sur les haut-parleurs
   de l'ordinateur.
+- Page « Jarvis » sur l'ordinateur (http://localhost:8765) : tu lui parles
+  avec le micro du PC, il te répond à voix haute.
 
 Usage :
     python jarvis_voix.py            # lance l'assistant
@@ -49,6 +51,8 @@ if not OLLAMA.startswith("http"):
     OLLAMA = "http://" + OLLAMA
 VOICE = os.environ.get("JARVIS_VOIX", "fr-FR-HenriNeural")
 WHISPER_MODEL = os.environ.get("JARVIS_WHISPER", "small")
+WEB_HOST = os.environ.get("JARVIS_HOST", "127.0.0.1")
+WEB_PORT = int(os.environ.get("JARVIS_PORT", "8765"))
 
 JOURS = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
 MOIS = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août",
@@ -797,24 +801,29 @@ async def on_message(update, context) -> None:
     else:
         question = msg.text or ""
 
-    if MOTS_RAPPEL.search(question):
-        parsed = parse_rappel(question)
-        if parsed is None:
-            await say(context.bot, chat_id, "Je veux bien, mais pour quand ? Dis par exemple : "
-                      "rappelle-moi demain à 9 h d'appeler maman.", reply_to=msg)
-        else:
-            when, what = parsed
-            add_reminder(when, what)
-            await say(context.bot, chat_id, f"C'est noté : je te rappellerai {fmt_when(when)} : {what}.",
-                      reply_to=msg)
-        return
-
     try:
-        answer = await ask_jarvis(chat_id, question)
+        answer = await handle_question(question)
     except Exception as exc:  # noqa: BLE001
         await msg.reply_text(f"L'IA ne répond pas ({exc}). Est-ce qu'Ollama tourne ?")
         return
     await say(context.bot, chat_id, answer, reply_to=msg)
+
+
+def conversation_id() -> int:
+    """Même fil de discussion pour Telegram et la page de l'ordinateur."""
+    return int(ALLOWED[0]) if ALLOWED and ALLOWED[0].lstrip("-").isdigit() else 0
+
+
+async def handle_question(question: str) -> str:
+    """Rappel perso, sinon question à Jarvis. Retourne le texte de la réponse."""
+    if MOTS_RAPPEL.search(question):
+        parsed = parse_rappel(question)
+        if parsed is None:
+            return "Je veux bien, mais pour quand ? Dis par exemple : rappelle-moi demain à 9 h d'appeler maman."
+        when, what = parsed
+        add_reminder(when, what)
+        return f"C'est noté : je te rappellerai {fmt_when(when)} : {what}."
+    return await ask_jarvis(conversation_id(), question)
 
 
 async def cmd_courriels(update, context) -> None:
@@ -1061,6 +1070,217 @@ async def watcher(app) -> None:
         await asyncio.sleep(60)
 
 
+# ---------------------------------------------------------------------------
+# Page « Jarvis » sur l'ordinateur : parler avec le micro du PC
+# ---------------------------------------------------------------------------
+
+PAGE = r"""<!doctype html>
+<html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jarvis</title>
+<style>
+  :root { --bg:#0b1020; --panel:#121a33; --text:#e8ecff; --muted:#8d97c7; --accent:#4cc9ff; --me:#1f2b55; --warn:#ffb74d; }
+  * { box-sizing:border-box; }
+  body { margin:0; min-height:100vh; background:radial-gradient(circle at 50% 0%, #17224a, var(--bg) 60%);
+         color:var(--text); font:16px/1.45 system-ui, "Segoe UI", sans-serif; display:flex; flex-direction:column; align-items:center; }
+  header { width:100%; max-width:760px; padding:20px 16px 0; display:flex; justify-content:space-between; align-items:center; }
+  h1 { font-size:20px; letter-spacing:.2em; margin:0; font-weight:600; }
+  #etat { color:var(--muted); font-size:14px; }
+  #orbe { margin:28px 0 12px; width:190px; height:190px; border-radius:50%; border:none; cursor:pointer; position:relative;
+          background:radial-gradient(circle at 35% 30%, #9be7ff, var(--accent) 35%, #0a6aa8 70%, #062a4a);
+          box-shadow:0 0 40px #4cc9ff55, inset 0 0 30px #00000066; transition:transform .2s, box-shadow .3s; }
+  #orbe:focus-visible { outline:3px solid #fff; outline-offset:6px; }
+  #orbe.ecoute { animation:pulse 1.4s ease-in-out infinite; }
+  #orbe.parle { box-shadow:0 0 80px #4cc9ffaa, inset 0 0 30px #00000066; animation:parle .5s ease-in-out infinite alternate; }
+  #orbe.pense { animation:tourne 1.2s linear infinite; filter:saturate(.6); }
+  #orbe.arret { filter:grayscale(.7) brightness(.7); }
+  #niveau { position:absolute; inset:-10px; border-radius:50%; border:3px solid #4cc9ff; opacity:0; transition:opacity .1s, transform .1s; pointer-events:none; }
+  @keyframes pulse { 50% { transform:scale(1.06); box-shadow:0 0 60px #4cc9ff88, inset 0 0 30px #00000066; } }
+  @keyframes parle { to { transform:scale(1.08); } }
+  @keyframes tourne { to { filter:saturate(.6) hue-rotate(360deg); } }
+  #consigne { color:var(--muted); margin:0 16px 18px; text-align:center; min-height:1.4em; }
+  #fil { width:100%; max-width:760px; padding:0 16px; flex:1; display:flex; flex-direction:column; gap:10px; overflow-y:auto; }
+  .bulle { max-width:85%; padding:10px 14px; border-radius:14px; background:var(--panel); white-space:pre-wrap; }
+  .moi { align-self:flex-end; background:var(--me); }
+  .erreur { color:var(--warn); }
+  form { width:100%; max-width:760px; padding:14px 16px 20px; display:flex; gap:8px; }
+  input { flex:1; min-width:0; padding:12px 14px; border-radius:12px; border:1px solid #2a3770; background:#0e1530; color:var(--text); font-size:16px; }
+  button.envoyer { padding:0 18px; border-radius:12px; border:none; background:var(--accent); color:#04233a; font-weight:600; cursor:pointer; }
+</style></head>
+<body>
+<header><h1>JARVIS</h1><span id="etat">prêt</span></header>
+<button id="orbe" class="arret" aria-label="Commencer ou arrêter la conversation"><span id="niveau"></span></button>
+<p id="consigne">Clique sur le cercle (ou appuie sur Espace) pour parler à Jarvis.</p>
+<div id="fil" aria-live="polite"></div>
+<form id="formulaire"><input id="texte" placeholder="…ou écris ta question ici" autocomplete="off">
+<button class="envoyer">Envoyer</button></form>
+<script>
+const orbe = document.getElementById('orbe'), niveau = document.getElementById('niveau'),
+      etat = document.getElementById('etat'), consigne = document.getElementById('consigne'),
+      fil = document.getElementById('fil');
+let actif = false, flux = null, ctx = null, analyseur = null, enregistreur = null, morceaux = [],
+    occupe = false, lecteur = new Audio(), fond = 0.01;
+
+function mode(m, txt) { orbe.className = m; etat.textContent = txt; }
+function ajoute(texte, classe) { const d = document.createElement('div'); d.className = 'bulle ' + (classe || '');
+  d.textContent = texte; fil.appendChild(d); fil.scrollTop = fil.scrollHeight; }
+
+async function demarrer() {
+  try {
+    flux = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+  } catch (e) { ajoute("Je n'ai pas accès au micro. Autorise-le dans le navigateur (icône 🔒 ou 🎤 dans la barre d'adresse).", 'erreur'); return; }
+  ctx = new AudioContext(); analyseur = ctx.createAnalyser(); analyseur.fftSize = 1024;
+  ctx.createMediaStreamSource(flux).connect(analyseur);
+  actif = true; consigne.textContent = "Je t'écoute… Parle normalement, je réponds quand tu t'arrêtes. Clique encore pour arrêter.";
+  ecouter();
+}
+function arreter() {
+  actif = false; if (enregistreur && enregistreur.state !== 'inactive') enregistreur.stop();
+  if (flux) flux.getTracks().forEach(t => t.stop()); if (ctx) ctx.close(); flux = ctx = null;
+  lecteur.pause(); speechSynthesis.cancel(); mode('arret', 'en pause');
+  consigne.textContent = 'Clique sur le cercle (ou appuie sur Espace) pour parler à Jarvis.';
+}
+function volume() { const d = new Float32Array(analyseur.fftSize); analyseur.getFloatTimeDomainData(d);
+  let s = 0; for (const v of d) s += v * v; return Math.sqrt(s / d.length); }
+
+async function ecouter() {
+  if (!actif || occupe) return;
+  mode('ecoute', "j'écoute");
+  enregistreur = new MediaRecorder(flux); morceaux = [];
+  enregistreur.ondataavailable = e => { if (e.data.size) morceaux.push(e.data); };
+  let parle = false, debut = 0, dernierSon = 0; const t0 = performance.now();
+  enregistreur.onstop = async () => {
+    niveau.style.opacity = 0;
+    if (!actif) return;
+    if (!parle) { ecouter(); return; }
+    await envoyer(new Blob(morceaux, { type: enregistreur.mimeType }));
+  };
+  enregistreur.start(250);
+  const boucle = () => {
+    if (!actif || enregistreur.state === 'inactive') return;
+    const v = volume(), t = performance.now();
+    // Bruit de fond estimé en continu : descend vite, remonte lentement (la voix ne le fausse pas).
+    fond = v < fond ? v : fond * 0.998 + v * 0.002;
+    const seuil = Math.max(0.012, fond * 3);
+    niveau.style.opacity = Math.min(1, v / (seuil * 3)); niveau.style.transform = `scale(${1 + Math.min(.25, v * 3)})`;
+    if (v > seuil) { if (!parle) { parle = true; debut = t; } dernierSon = t; }
+    if (parle && t - dernierSon > 1300 && t - debut > 400) return enregistreur.stop();   // fin de phrase
+    if (parle && t - debut > 30000) return enregistreur.stop();                          // 30 s max
+    if (!parle && t - t0 > 15000) return enregistreur.stop();                            // relance l'écoute
+    requestAnimationFrame(boucle);
+  };
+  boucle();
+}
+
+async function appel(url, options) {
+  const r = await fetch(url, { ...options, headers: { ...(options.headers || {}), 'X-Jarvis': '1' } });
+  if (!r.ok) throw new Error('erreur ' + r.status);
+  return r.json();
+}
+async function envoyer(blob) {
+  occupe = true; mode('pense', 'je réfléchis…');
+  try { repondre(await appel('/parler', { method: 'POST', body: blob, headers: { 'Content-Type': blob.type || 'audio/webm' } })); }
+  catch (e) { ajoute('Oups : ' + e.message, 'erreur'); occupe = false; ecouter(); }
+}
+async function ecrire(texte) {
+  occupe = true; ajoute(texte, 'moi'); mode('pense', 'je réfléchis…');
+  try { repondre(await appel('/ecrire', { method: 'POST', body: JSON.stringify({ texte }), headers: { 'Content-Type': 'application/json' } }), true); }
+  catch (e) { ajoute('Oups : ' + e.message, 'erreur'); occupe = false; ecouter(); }
+}
+function repondre(r, dejaAffiche) {
+  if (r.question && !dejaAffiche) ajoute(r.question, 'moi');
+  if (r.reponse) ajoute(r.reponse);
+  const fin = () => { occupe = false; if (actif) ecouter(); else mode('arret', 'prêt'); };
+  mode('parle', 'je parle');
+  if (r.audio) { lecteur.src = 'data:audio/mpeg;base64,' + r.audio; lecteur.onended = fin; lecteur.onerror = fin; lecteur.play().catch(fin); }
+  else if (r.reponse) { const u = new SpeechSynthesisUtterance(r.reponse); u.lang = 'fr-FR'; u.onend = fin; u.onerror = fin; speechSynthesis.speak(u); }
+  else fin();
+}
+
+orbe.onclick = () => actif ? arreter() : demarrer();
+document.addEventListener('keydown', e => { if (e.code === 'Space' && document.activeElement.tagName !== 'INPUT') { e.preventDefault(); orbe.click(); } });
+document.getElementById('formulaire').onsubmit = e => { e.preventDefault(); const t = document.getElementById('texte');
+  if (t.value.trim() && !occupe) { ecrire(t.value.trim()); t.value = ''; } };
+ajoute("Bonjour ! Je suis Jarvis. Clique sur le cercle et parle-moi, ou écris-moi en bas.");
+</script></body></html>
+"""
+
+
+async def tts_base64(text: str) -> str | None:
+    import base64
+
+    import edge_tts
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            mp3 = os.path.join(tmp, "r.mp3")
+            await edge_tts.Communicate(text, VOICE).save(mp3)
+            return base64.b64encode(Path(mp3).read_bytes()).decode()
+    except Exception as exc:  # noqa: BLE001
+        print(f"Voix (page) indisponible, le navigateur parlera à la place : {exc}", flush=True)
+        return None
+
+
+def build_web_app():
+    from aiohttp import web
+
+    allowed_hosts = {f"localhost:{WEB_PORT}", f"127.0.0.1:{WEB_PORT}", f"[::1]:{WEB_PORT}"}
+
+    @web.middleware
+    async def securite(request, handler):
+        # Seulement depuis cet ordinateur, et pas depuis un autre site web.
+        origin = request.headers.get("Origin")
+        if request.host not in allowed_hosts or (origin and origin.split("//")[-1] not in allowed_hosts):
+            return web.Response(status=403, text="Accès refusé")
+        if request.method == "POST" and request.headers.get("X-Jarvis") != "1":
+            return web.Response(status=403, text="Accès refusé")
+        return await handler(request)
+
+    async def index(request):
+        return web.Response(text=PAGE, content_type="text/html", headers={"Cache-Control": "no-store"})
+
+    async def reponse(question: str):
+        if not question:
+            texte = "Je n'ai pas compris, tu peux répéter ?"
+        else:
+            try:
+                texte = await handle_question(question)
+            except Exception as exc:  # noqa: BLE001
+                texte = f"L'IA ne répond pas ({exc}). Est-ce qu'Ollama tourne ?"
+        return web.json_response({"question": question, "reponse": texte, "audio": await tts_base64(texte)})
+
+    async def parler(request):
+        data = await request.read()
+        if len(data) < 2000:
+            return await reponse("")
+        ext = ".ogg" if "ogg" in request.content_type else ".webm"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "micro" + ext)
+            Path(path).write_bytes(data)
+            question = await asyncio.to_thread(transcribe, path)
+        return await reponse(question)
+
+    async def ecrire(request):
+        body = await request.json()
+        return await reponse(str(body.get("texte", "")).strip()[:2000])
+
+    app = web.Application(middlewares=[securite], client_max_size=20 * 1024 * 1024)
+    app.add_routes([web.get("/", index), web.post("/parler", parler), web.post("/ecrire", ecrire)])
+    return app
+
+
+async def start_web() -> None:
+    from aiohttp import web
+
+    runner = web.AppRunner(build_web_app())
+    await runner.setup()
+    try:
+        await web.TCPSite(runner, WEB_HOST, WEB_PORT).start()
+        print(f"🎤 Page Jarvis : http://localhost:{WEB_PORT}  (ouvre-la dans ton navigateur)", flush=True)
+    except OSError as exc:
+        print(f"Page Jarvis indisponible (port {WEB_PORT} occupé ?) : {exc}", flush=True)
+
+
 def ensure_ollama() -> subprocess.Popen | None:
     try:
         httpx.get(f"{OLLAMA}/api/tags", timeout=3)
@@ -1101,6 +1321,7 @@ def main() -> None:
 
     async def post_init(app) -> None:
         tasks.append(asyncio.create_task(watcher(app)))
+        await start_web()
 
     try:
         app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
