@@ -389,7 +389,7 @@ def geocode(city: str) -> dict:
     return res[0]
 
 
-def weather_text(s: dict) -> str:
+def weather_data(s: dict) -> dict:
     r = httpx.get("https://api.open-meteo.com/v1/forecast", timeout=20, params={
         "latitude": s["lat"], "longitude": s["lon"], "timezone": "auto", "forecast_days": 3,
         "current": "temperature_2m,apparent_temperature,weather_code,wind_speed_10m",
@@ -397,17 +397,30 @@ def weather_text(s: dict) -> str:
     })
     r.raise_for_status()
     d = r.json()
-    c = d["current"]
-    lines = [f"MÉTÉO à {s.get('city_label') or s.get('city')} :",
-             f"Maintenant : {round(c['temperature_2m'])} °C (ressenti {round(c['apparent_temperature'])} °C), "
-             f"{METEO_CODES.get(c['weather_code'], 'temps variable')}, vent {round(c['wind_speed_10m'])} km/h."]
-    dd = d["daily"]
-    for i, jour in enumerate(dd["time"]):
-        nom = ["Aujourd'hui", "Demain", "Après-demain"][i] if i < 3 else jour
-        pluie = dd["precipitation_probability_max"][i]
-        lines.append(f"{nom} : {METEO_CODES.get(dd['weather_code'][i], 'variable')}, "
-                     f"min {round(dd['temperature_2m_min'][i])} °C, max {round(dd['temperature_2m_max'][i])} °C"
-                     + (f", {pluie} % de risque de précipitations." if pluie is not None else "."))
+    c, dd = d["current"], d["daily"]
+    jours = []
+    for i in range(len(dd["time"])):
+        jours.append({
+            "nom": ["Aujourd'hui", "Demain", "Après-demain"][i] if i < 3 else dd["time"][i],
+            "ciel": METEO_CODES.get(dd["weather_code"][i], "variable"),
+            "min": round(dd["temperature_2m_min"][i]), "max": round(dd["temperature_2m_max"][i]),
+            "pluie": dd["precipitation_probability_max"][i],
+        })
+    return {
+        "ville": s.get("city_label") or s.get("city"),
+        "temp": round(c["temperature_2m"]), "ressenti": round(c["apparent_temperature"]),
+        "ciel": METEO_CODES.get(c["weather_code"], "temps variable"), "vent": round(c["wind_speed_10m"]),
+        "jours": jours,
+    }
+
+
+def weather_text(s: dict, w: dict | None = None) -> str:
+    w = w or weather_data(s)
+    lines = [f"MÉTÉO à {w['ville']} :",
+             f"Maintenant : {w['temp']} °C (ressenti {w['ressenti']} °C), {w['ciel']}, vent {w['vent']} km/h."]
+    for j in w["jours"]:
+        lines.append(f"{j['nom']} : {j['ciel']}, min {j['min']} °C, max {j['max']} °C"
+                     + (f", {j['pluie']} % de risque de précipitations." if j["pluie"] is not None else "."))
     return "\n".join(lines)
 
 
@@ -946,10 +959,23 @@ async def cmd_cherche(update, context) -> None:
     await say(context.bot, update.effective_chat.id, text or res)
 
 
+async def cmd_recap(update, context) -> None:
+    if not _allowed(update):
+        return
+    await context.bot.send_chat_action(update.effective_chat.id, "typing")
+    try:
+        texte = await recap_text(await collect_overview(load_settings()))
+    except Exception as exc:  # noqa: BLE001
+        await update.effective_message.reply_text(f"Récap impossible : {exc}")
+        return
+    await say(context.bot, update.effective_chat.id, texte)
+
+
 async def cmd_aide(update, context) -> None:
     await update.effective_message.reply_text(
         "Je suis Jarvis 🤖\n\n"
         "• Parle-moi en vocal 🎤 ou écris-moi.\n"
+        "• /recap — tout ce qui se passe, en résumé\n"
         "• /agenda — tes prochains rendez-vous\n"
         "• /courriels — tes derniers courriels\n"
         "• /meteo — la météo\n"
@@ -961,42 +987,89 @@ async def cmd_aide(update, context) -> None:
     )
 
 
-async def morning_brief(bot, chat_id: str, s: dict) -> None:
-    extra = []
-    if s.get("ics_url"):
-        try:
-            today = datetime.now().astimezone().date()
-            evs = [e for e in await asyncio.to_thread(fetch_events, s, 1) if e["start"].date() == today]
-            extra.append("AGENDA D'AUJOURD'HUI :\n" + events_text(evs))
-        except Exception as exc:  # noqa: BLE001
-            extra.append(f"AGENDA : illisible ({exc})")
-    if s.get("email"):
-        try:
-            mails = [m for m in await asyncio.to_thread(fetch_emails, s, 15) if m["unread"]]
-            extra.append(f"COURRIELS NON LUS ({len(mails)}) :\n" + emails_text(mails[:8]))
-        except Exception as exc:  # noqa: BLE001
-            extra.append(f"COURRIELS : illisibles ({exc})")
-    if s.get("lat"):
-        try:
-            extra.append(await asyncio.to_thread(weather_text, s))
-        except Exception as exc:  # noqa: BLE001
-            extra.append(f"MÉTÉO : illisible ({exc})")
-    if s.get("news_url"):
-        try:
-            extra.append("NOUVELLES :\n" + "\n".join(f"- {t}" for t in await asyncio.to_thread(fetch_news, s, 4)))
-        except Exception as exc:  # noqa: BLE001
-            extra.append(f"NOUVELLES : illisibles ({exc})")
-    today_rem = [r for r in load_reminders() if datetime.fromisoformat(r["when"]).date() == datetime.now().astimezone().date()]
-    if today_rem:
-        extra.append("RAPPELS D'AUJOURD'HUI :\n" + "\n".join(
-            f"- {fmt_hour(datetime.fromisoformat(r['when']))} : {r['what']}" for r in today_rem))
+async def collect_overview(s: dict) -> dict:
+    """Tout ce qui se passe, en parallèle : agenda, courriels, météo, rappels, nouvelles."""
+    now = datetime.now().astimezone()
+    out: dict = {"erreurs": {}}
+
+    async def agenda():
+        evs = await asyncio.to_thread(fetch_events, s, 1)
+        tomorrow = now.date() + timedelta(days=1)
+        out["agenda"] = [
+            {"quand": describe_event(e).split(" : ")[0], "titre": e["title"], "lieu": e["where"]}
+            for e in evs
+            if (e["all_day"] and e["start"].date() >= now.date()) or (not e["all_day"] and e["start"] >= now)
+            if e["start"].date() <= tomorrow
+        ]
+
+    async def courriels():
+        mails = await asyncio.to_thread(fetch_emails, s, 15)
+        out["courriels"] = [{"de": m["from"], "objet": m["subject"],
+                             "quand": fmt_when(m["date"]) if m["date"] else "", "debut": m["body"][:200]}
+                            for m in mails if m["unread"]]
+
+    async def meteo():
+        out["meteo"] = await asyncio.to_thread(weather_data, s)
+
+    async def nouvelles():
+        out["nouvelles"] = await asyncio.to_thread(fetch_news, s, 4)
+
+    jobs = {"agenda": (s.get("ics_url"), agenda), "courriels": (s.get("email"), courriels),
+            "meteo": (s.get("lat"), meteo), "nouvelles": (s.get("news_url"), nouvelles)}
+    actifs = [(nom, fn) for nom, (ok, fn) in jobs.items() if ok]
+    results = await asyncio.gather(*(fn() for _, fn in actifs), return_exceptions=True)
+    for (nom, _), res in zip(actifs, results):
+        if isinstance(res, Exception):
+            out["erreurs"][nom] = str(res)
+
+    limite = now + timedelta(hours=36)
+    out["rappels"] = [{"quand": fmt_when(datetime.fromisoformat(r["when"])), "quoi": r["what"]}
+                      for r in load_reminders() if datetime.fromisoformat(r["when"]) <= limite]
+    out["heure"] = fmt_hour(now)
+    return out
+
+
+def overview_text(o: dict) -> str:
+    parts = []
+    if "meteo" in o:
+        w = o["meteo"]
+        parts.append(f"MÉTÉO à {w['ville']} : {w['temp']} °C (ressenti {w['ressenti']} °C), {w['ciel']}. "
+                     + " ".join(f"{j['nom']} : {j['ciel']}, {j['min']} à {j['max']} °C." for j in w["jours"][:2]))
+    if "agenda" in o:
+        parts.append("PROCHAINS RENDEZ-VOUS (aujourd'hui et demain) :\n"
+                     + ("\n".join(f"- {e['quand']} : {e['titre']}" + (f" ({e['lieu']})" if e["lieu"] else "")
+                                  for e in o["agenda"]) or "(aucun)"))
+    if o.get("rappels") is not None:
+        parts.append("RAPPELS À VENIR :\n" + ("\n".join(f"- {r['quand']} : {r['quoi']}" for r in o["rappels"])
+                                             or "(aucun)"))
+    if "courriels" in o:
+        parts.append(f"COURRIELS NON LUS ({len(o['courriels'])}) :\n"
+                     + ("\n".join(f"- De {m['de']} : {m['objet']}" for m in o["courriels"][:8]) or "(aucun)"))
+    if "nouvelles" in o:
+        parts.append("NOUVELLES :\n" + "\n".join(f"- {t}" for t in o["nouvelles"]))
+    return "\n\n".join(parts)
+
+
+async def recap_text(o: dict, matin: bool = False) -> str:
+    h = datetime.now().astimezone().hour
+    salut = "Bonjour" if h < 12 else "Bon après-midi" if h < 18 else "Bonsoir"
+    consigne = (
+        f"Fais-moi un récap de ce qui se passe (il est {o['heure']}). Commence par « {salut} », puis en 4 à 7 "
+        "phrases naturelles : la météo, mes prochains rendez-vous et rappels, les courriels non lus importants "
+        "(qui et à propos de quoi) et 2 nouvelles. Ne mentionne pas ce qui est vide."
+    )
+    if matin:
+        consigne = "C'est mon résumé du matin, souhaite-moi bonne journée. " + consigne
     text = await llm([
         {"role": "system", "content": system_prompt()},
-        {"role": "user", "content": "Voici mes vraies données :\n\n" + "\n\n".join(extra)
-         + "\n\nFais-moi mon résumé du matin : souhaite-moi bonne journée, donne la météo, "
-           "dis-moi mes rendez-vous et rappels d'aujourd'hui, les courriels importants et 2 ou 3 nouvelles."},
+        {"role": "user", "content": "Voici mes vraies données :\n\n" + overview_text(o) + "\n\n" + consigne},
     ])
-    await say(bot, chat_id, text or "Bonjour ! Je n'ai rien de spécial à te signaler ce matin.")
+    return text or f"{salut} ! Rien de spécial à te signaler pour le moment."
+
+
+async def morning_brief(bot, chat_id: str, s: dict) -> None:
+    o = await collect_overview(s)
+    await say(bot, chat_id, await recap_text(o, matin=True))
 
 
 async def watcher(app) -> None:
@@ -1099,6 +1172,7 @@ PAGE = r"""<!doctype html>
   @keyframes parle { to { transform:scale(1.08); } }
   @keyframes tourne { to { filter:saturate(.6) hue-rotate(360deg); } }
   #consigne { color:var(--muted); margin:0 16px 18px; text-align:center; min-height:1.4em; }
+  .ecouter { margin-top:8px; background:none; border:1px solid var(--accent); color:var(--accent); border-radius:10px; padding:4px 10px; cursor:pointer; }
   #fil { width:100%; max-width:760px; padding:0 16px; flex:1; display:flex; flex-direction:column; gap:10px; overflow-y:auto; }
   .bulle { max-width:85%; padding:10px 14px; border-radius:14px; background:var(--panel); white-space:pre-wrap; }
   .moi { align-self:flex-end; background:var(--me); }
@@ -1110,7 +1184,7 @@ PAGE = r"""<!doctype html>
 <body>
 <header><h1>JARVIS</h1><span id="etat">prêt</span></header>
 <button id="orbe" class="arret" aria-label="Commencer ou arrêter la conversation"><span id="niveau"></span></button>
-<p id="consigne">Clique sur le cercle (ou appuie sur Espace) pour parler à Jarvis.</p>
+<p id="consigne">Clique sur le cercle (ou appuie sur Espace) pour me parler.</p>
 <div id="fil" aria-live="polite"></div>
 <form id="formulaire"><input id="texte" placeholder="…ou écris ta question ici" autocomplete="off">
 <button class="envoyer">Envoyer</button></form>
@@ -1120,6 +1194,28 @@ const orbe = document.getElementById('orbe'), niveau = document.getElementById('
       fil = document.getElementById('fil');
 let actif = false, flux = null, ctx = null, analyseur = null, enregistreur = null, morceaux = [],
     occupe = false, lecteur = new Audio(), fond = 0.01;
+
+let recap = null;
+async function chargerRecap() {
+  const attente = document.createElement('div'); attente.className = 'bulle'; attente.textContent = '📋 Je prépare ton récap…';
+  fil.appendChild(attente); mode('pense', 'je prépare ton récap');
+  try { recap = await appel('/recap', { method: 'POST', body: JSON.stringify({ pc: true }), headers: { 'Content-Type': 'application/json' } }); }
+  catch (e) { attente.textContent = "📋 Je n'ai pas pu préparer le récap (" + e.message + ')'; mode('arret', 'prêt'); return; }
+  attente.textContent = '📋 ' + recap.reponse;
+  if (!actif) mode('arret', recap.parle_pc ? 'je te parle' : 'prêt');
+  if (!recap.parle_pc && recap.audio && !occupe) { occupe = true; jouer(recap, () => { occupe = false; if (actif) ecouter(); else mode('arret', 'prêt'); }); }
+  const b = document.createElement('button'); b.className = 'ecouter'; b.textContent = '🔊 Réécouter';
+  b.onclick = async () => { if (occupe) return; occupe = true;
+    let r = recap; if (!r.audio) { try { r = await appel('/recap', { method: 'POST', body: '{}', headers: { 'Content-Type': 'application/json' } }); } catch (e) {} }
+    jouer(r, () => { occupe = false; if (actif) ecouter(); else mode('arret', 'prêt'); }); };
+  attente.appendChild(document.createElement('br')); attente.appendChild(b);
+}
+function jouer(r, fin) {
+  mode('parle', 'je parle');
+  if (r.audio) { lecteur.src = 'data:audio/mpeg;base64,' + r.audio; lecteur.onended = fin; lecteur.onerror = fin; lecteur.play().catch(fin); }
+  else if (r.reponse) { const u = new SpeechSynthesisUtterance(r.reponse); u.lang = 'fr-FR'; u.onend = fin; u.onerror = fin; speechSynthesis.speak(u); }
+  else fin();
+}
 
 function mode(m, txt) { orbe.className = m; etat.textContent = txt; }
 function ajoute(texte, classe) { const d = document.createElement('div'); d.className = 'bulle ' + (classe || '');
@@ -1190,18 +1286,14 @@ async function ecrire(texte) {
 function repondre(r, dejaAffiche) {
   if (r.question && !dejaAffiche) ajoute(r.question, 'moi');
   if (r.reponse) ajoute(r.reponse);
-  const fin = () => { occupe = false; if (actif) ecouter(); else mode('arret', 'prêt'); };
-  mode('parle', 'je parle');
-  if (r.audio) { lecteur.src = 'data:audio/mpeg;base64,' + r.audio; lecteur.onended = fin; lecteur.onerror = fin; lecteur.play().catch(fin); }
-  else if (r.reponse) { const u = new SpeechSynthesisUtterance(r.reponse); u.lang = 'fr-FR'; u.onend = fin; u.onerror = fin; speechSynthesis.speak(u); }
-  else fin();
+  jouer(r, () => { occupe = false; if (actif) ecouter(); else mode('arret', 'prêt'); });
 }
 
 orbe.onclick = () => actif ? arreter() : demarrer();
 document.addEventListener('keydown', e => { if (e.code === 'Space' && document.activeElement.tagName !== 'INPUT') { e.preventDefault(); orbe.click(); } });
 document.getElementById('formulaire').onsubmit = e => { e.preventDefault(); const t = document.getElementById('texte');
   if (t.value.trim() && !occupe) { ecrire(t.value.trim()); t.value = ''; } };
-ajoute("Bonjour ! Je suis Jarvis. Clique sur le cercle et parle-moi, ou écris-moi en bas.");
+chargerRecap();
 </script></body></html>
 """
 
@@ -1264,8 +1356,30 @@ def build_web_app():
         body = await request.json()
         return await reponse(str(body.get("texte", "")).strip()[:2000])
 
+    cache: dict = {}
+
+    async def recap(request):
+        """Récap de ce qui se passe. Avec {"pc": true}, Jarvis le dit sur les haut-parleurs de l'ordi
+        (pas besoin de cliquer : le navigateur n'a rien à jouer)."""
+        body = await request.json() if request.can_read_body else {}
+        if not (cache.get("texte") and time.time() - cache.get("t", 0) < 600):
+            try:
+                cache["texte"] = await recap_text(await collect_overview(load_settings()))
+                cache["t"] = time.time()
+            except Exception as exc:  # noqa: BLE001
+                return web.json_response({"reponse": f"Je n'arrive pas à préparer le récap ({exc}).", "audio": None})
+        texte = cache["texte"]
+        if body.get("pc"):
+            try:
+                await speak_on_pc(texte)
+                return web.json_response({"reponse": texte, "audio": None, "parle_pc": True})
+            except Exception as exc:  # noqa: BLE001
+                print(f"Récap sur les haut-parleurs impossible : {exc}", flush=True)
+        return web.json_response({"reponse": texte, "audio": await tts_base64(texte)})
+
     app = web.Application(middlewares=[securite], client_max_size=20 * 1024 * 1024)
-    app.add_routes([web.get("/", index), web.post("/parler", parler), web.post("/ecrire", ecrire)])
+    app.add_routes([web.get("/", index), web.post("/parler", parler), web.post("/ecrire", ecrire),
+                    web.post("/recap", recap)])
     return app
 
 
@@ -1329,6 +1443,7 @@ def main() -> None:
         app.add_handler(CommandHandler(["courriels", "courriel", "mails"], cmd_courriels))
         app.add_handler(CommandHandler("agenda", cmd_agenda))
         app.add_handler(CommandHandler("rappels", cmd_rappels))
+        app.add_handler(CommandHandler("recap", cmd_recap))
         app.add_handler(CommandHandler("effacer", cmd_effacer))
         app.add_handler(CommandHandler("meteo", cmd_meteo))
         app.add_handler(CommandHandler("nouvelles", cmd_nouvelles))
