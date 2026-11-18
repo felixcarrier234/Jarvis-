@@ -6,9 +6,21 @@ set -euo pipefail
 
 LANCEUR="$HOME/jarvis-demarrage.sh"
 LOG="$HOME/.openjarvis/jarvis-voix.log"
-APPDATA_WIN="$(cmd.exe /c 'echo %APPDATA%' 2>/dev/null | tr -d '\r')"
-[[ -n "$APPDATA_WIN" ]] || { echo "Ce script doit être lancé dans Ubuntu sous Windows (WSL)."; exit 1; }
-STARTUP="$(wslpath "$APPDATA_WIN")/Microsoft/Windows/Start Menu/Programs/Startup"
+# Trouver le dossier « Démarrage » de Windows (depuis C:\ pour éviter les soucis de chemin UNC).
+cd /mnt/c 2>/dev/null || true
+STARTUP_WIN="$(powershell.exe -NoProfile -Command '[Environment]::GetFolderPath("Startup")' 2>/dev/null | tr -d '\r' | tail -n1 || true)"
+if [[ ! "$STARTUP_WIN" =~ ^[A-Za-z]:\\ ]]; then
+  APPDATA_WIN="$(cmd.exe /c 'echo %APPDATA%' 2>/dev/null | tr -d '\r' | tail -n1 || true)"
+  [[ "$APPDATA_WIN" =~ ^[A-Za-z]:\\ ]] && STARTUP_WIN="$APPDATA_WIN\\Microsoft\\Windows\\Start Menu\\Programs\\Startup"
+fi
+STARTUP="$(wslpath -u "$STARTUP_WIN" 2>/dev/null || true)"
+cd "$HOME"
+if [[ -z "$STARTUP" || ! -d "$(dirname "$STARTUP")" ]]; then
+  echo "❌ Impossible de trouver le dossier Démarrage de Windows."
+  echo "   Réponse de Windows : « $STARTUP_WIN »"
+  echo "   Copie ces deux lignes à Claude."
+  exit 1
+fi
 VBS="$STARTUP/Jarvis.vbs"
 
 if [[ "${1:-}" == "retirer" ]]; then
@@ -40,6 +52,10 @@ mkdir -p "$STARTUP"
 printf 'Set s = CreateObject("WScript.Shell")\r\ns.Run "wsl.exe -d %s -- bash -lc ""~/jarvis-demarrage.sh""", 0, False\r\n' \
   "$WSL_DISTRO_NAME" > "$VBS"
 
+# 3) Le lancer tout de suite (en arrière-plan, sans fenêtre).
+(cd /mnt/c 2>/dev/null; wscript.exe "$(wslpath -w "$VBS")" >/dev/null 2>&1 &) || true
+
 echo "✅ Démarrage automatique installé."
+echo "   Jarvis démarre en arrière-plan (environ 20 secondes)."
 echo "   Raccourci Windows : $VBS"
 echo "   Journal de Jarvis : $LOG"
