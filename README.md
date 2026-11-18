@@ -32,6 +32,23 @@ jarvis gui                       # interface dans le navigateur (Node.js 22+)
 Autres presets disponibles (remplacent la config) :
 `jarvis init --preset <nom> --force` avec `code-assistant`, `deep-research`, `morning-digest-mac`, `morning-digest-linux`, `scheduled-monitor`, `chat-simple`.
 
+## Parler à Jarvis depuis ton téléphone (Telegram)
+
+Jarvis tourne sur ton ordinateur ; ton téléphone lui écrit via un bot Telegram privé.
+
+1. Installe **Telegram** sur ton téléphone.
+2. Sur l'ordinateur (après `./install.sh`) : `./telephone.sh`
+3. Le script te demande :
+   - le **token du bot** : écris `/newbot` à **@BotFather** dans Telegram ;
+   - ton **Id Telegram** : écris à **@userinfobot**. Seul ton compte pourra parler au bot.
+4. Il démarre Jarvis (`jarvis serve`). Ouvre ton bot dans Telegram, appuie sur **Démarrer** et écris-lui.
+
+**Pour parler à voix haute** : appuie sur le 🎤 du clavier de ton téléphone (dictée) dans la conversation Telegram.
+Les messages vocaux Telegram (le bouton micro du bot) ne sont pas encore compris par OpenJarvis, seul le texte l'est.
+
+Ensuite, pour relancer Jarvis : `jarvis serve`. L'ordinateur doit rester allumé et connecté.
+Le token est stocké dans `~/.openjarvis/config.toml` (droits 600) : ne le partage pas.
+
 ## Configuration
 
 `config/config.toml` = preset `chat-simple` + profil de sécurité `personal` + analytics désactivées.
