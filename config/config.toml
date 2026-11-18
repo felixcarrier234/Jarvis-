@@ -1,0 +1,24 @@
+# Configuration OpenJarvis — copiée dans ~/.openjarvis/config.toml par install.sh
+# Basée sur le preset officiel "chat-simple" + profil de sécurité "personal".
+
+[engine]
+default = "ollama"
+
+[intelligence]
+default_model = "qwen3.5:4b"       # rapide et léger (~3 Go)
+# default_model = "qwen3.5:9b"     # meilleure qualité, demande plus de RAM
+# default_model = "llama3.1:8b"    # alternative
+
+[agent]
+default_agent = "simple"            # discussion simple, sans outils
+
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[security]
+profile = "personal"
+
+[analytics]
+enabled = false
+choice_recorded = true
