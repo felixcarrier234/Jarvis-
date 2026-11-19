@@ -18,6 +18,7 @@ Usage :
     python jarvis_voix.py modele     # choisir la meilleure IA selon la carte graphique
     python jarvis_voix.py accelerer  # reconnaissance vocale sur la carte graphique (NVIDIA)
     python jarvis_voix.py google     # autoriser Jarvis à modifier ton Google Agenda
+    python jarvis_voix.py memoire    # rendre à Windows la mémoire inutilisée (moins de RAM prise)
     python jarvis_voix.py diagnostic # tout tester
 
 Parle directement à Ollama (le moteur d'IA local installé avec OpenJarvis).
@@ -248,6 +249,43 @@ def accelerer() -> None:
     print("✅ La reconnaissance vocale utilisera la carte graphique. Redémarre Jarvis :  pkill -f jarvis_voix.py")
 
 
+def memoire_wsl() -> None:
+    """Fait rendre à Windows la mémoire dont Jarvis (WSL) ne se sert plus, et limite son maximum."""
+    import configparser
+
+    try:
+        r = powershell("[Console]::OutputEncoding=[Text.Encoding]::UTF8; $env:USERPROFILE; "
+                       "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory")
+        lignes = [x.strip() for x in r.stdout.strip().splitlines() if x.strip()]
+        profil, total_go = lignes[0], int(lignes[1]) / 1024 ** 3
+    except Exception as exc:  # noqa: BLE001
+        print(f"❌ Impossible de parler à Windows ({exc}).")
+        return
+    dossier = subprocess.run(["wslpath", "-u", profil], capture_output=True, text=True).stdout.strip()
+    if not dossier or not os.path.isdir(dossier):
+        print(f"❌ Dossier Windows introuvable : {profil}")
+        return
+    fichier = Path(dossier) / ".wslconfig"
+    limite = 6 if total_go <= 17 else int(total_go // 2)
+    cfg = configparser.ConfigParser()
+    cfg.optionxform = str  # garder les majuscules (autoMemoryReclaim)
+    if fichier.exists():
+        cfg.read(fichier, encoding="utf-8")
+        (fichier.with_name(".wslconfig.bak")).write_text(fichier.read_text(encoding="utf-8"), encoding="utf-8")
+    for sec in ("wsl2", "experimental"):
+        if not cfg.has_section(sec):
+            cfg.add_section(sec)
+    cfg.set("wsl2", "memory", f"{limite}GB")
+    cfg.set("experimental", "autoMemoryReclaim", "dropCache")
+    with open(fichier, "w", encoding="utf-8", newline="\r\n") as f:
+        cfg.write(f)
+    print(f"Mémoire de ton PC : {total_go:.0f} Go")
+    print(f"✅ Réglage écrit dans {profil}\\.wslconfig :")
+    print(f"   • Jarvis (WSL) ne pourra pas prendre plus de {limite} Go")
+    print("   • La mémoire qu'il n'utilise plus est rendue à Windows automatiquement")
+    print("\nPour l'appliquer : redémarre ton PC (Jarvis se relancera tout seul).")
+
+
 def choisir_voix() -> None:
     """Fait écouter chaque voix sur l'ordinateur, puis enregistre celle choisie."""
     s = load_settings()
@@ -362,6 +400,9 @@ def reglages() -> None:
                              "o" if s.get("mode_jeu_auto", True) else "n").lower().startswith("o")
     s["garder_ia_minutes"] = int(ask("14) Garder l'IA dans la carte graphique combien de minutes après une question ?",
                                      str(s.get("garder_ia_minutes", 10))) or 10)
+    choix = ask("15) Pendant un jeu : 1 = petite IA sur le processeur, 2 = IA en pause (le plus léger)",
+                "2" if s.get("ia_en_jeu") == "pause" else "1")
+    s["ia_en_jeu"] = "pause" if choix.strip() == "2" else "petite"
 
     save_settings(s)
     print(f"\nRéglages enregistrés dans {SETTINGS}\n\nTest des connexions…")
@@ -1810,6 +1851,14 @@ LANCEURS = (r"Launcher|EpicWebHelper|RiotClient|Battle\.net|Agent|steamwebhelper
             r"|upc|GalaxyClient|SocialClub|CrashReport|UnrealCEFSubProcess|Overlay|Helper|Updater|Setup|Installer")
 
 
+def ia_en_pause() -> bool:
+    return _jeu["actif"] and load_settings().get("ia_en_jeu", "petite") == "pause"
+
+
+PAUSE_MSG = ("Je suis en pause pendant votre partie pour ne pas ralentir le jeu. Les rappels, listes et minuteurs "
+             "marchent toujours. Dites « j'ai fini de jouer » pour me réveiller.")
+
+
 def garder_ia() -> str:
     return "0" if _jeu["actif"] else f"{int(load_settings().get('garder_ia_minutes', 10))}m"
 
@@ -1846,6 +1895,7 @@ async def liberer_carte_graphique() -> None:
 
 
 async def mode_jeu(actif: bool, manuel: bool = False, nom: str = "") -> str:
+    global _whisper
     if actif == _jeu["actif"]:
         return "Le mode jeu est déjà activé." if actif else "Le mode jeu est déjà désactivé."
     nom = re.sub(r"(?:-Win64)?(?:-Shipping)?$", "", nom)
@@ -1855,10 +1905,16 @@ async def mode_jeu(actif: bool, manuel: bool = False, nom: str = "") -> str:
     if actif:
         stop_pc_voice()
         await liberer_carte_graphique()
+        _whisper = None  # libère aussi la mémoire de la reconnaissance vocale
+        import gc
+
+        gc.collect()
         await diffuser({"t": "jeu", "v": True, "nom": nom})
+        if ia_en_pause():
+            return (f"Mode jeu activé{' pour ' + nom if nom else ''} : j'ai libéré la carte graphique et la mémoire, "
+                    "et je mets l'IA en pause. Les rappels, les listes et les alertes continuent.")
         return (f"Mode jeu activé{' pour ' + nom if nom else ''} : j'ai libéré la carte graphique. Je réponds toujours, "
                 "un peu plus lentement, et je reste discret sur les haut-parleurs.")
-    global _whisper
     if load_settings().get("whisper_gpu"):
         _whisper = None  # rechargée sur la carte graphique
     await diffuser({"t": "jeu", "v": False})
@@ -1891,6 +1947,8 @@ async def pick_model(client: httpx.AsyncClient) -> str:
 
 
 async def llm(messages: list[dict]) -> str:
+    if ia_en_pause():
+        return PAUSE_MSG
     async with httpx.AsyncClient(timeout=600) as client:
         body = {
             "model": await pick_model(client),
@@ -1971,6 +2029,9 @@ async def ask_jarvis(chat_id: int, question: str) -> str:
 
 async def llm_stream(messages: list[dict]):
     """Réponse de l'IA morceau par morceau (pour commencer à parler plus tôt)."""
+    if ia_en_pause():
+        yield PAUSE_MSG
+        return
     async with httpx.AsyncClient(timeout=600) as client:
         body = {"model": await pick_model(client), "messages": messages, "stream": True, "think": False,
                 "options": options_ia(), "keep_alive": garder_ia()}
@@ -2335,6 +2396,10 @@ async def on_message(update, context) -> None:
         return
 
     await context.bot.send_chat_action(chat_id, "typing")
+    if (msg.voice or msg.audio) and ia_en_pause():
+        await msg.reply_text("🎮 Pendant votre partie, écrivez-moi plutôt : la reconnaissance vocale est en pause "
+                             "pour ne pas ralentir le jeu.")
+        return
     if msg.voice or msg.audio:
         with tempfile.TemporaryDirectory() as tmp:
             f = await (msg.voice or msg.audio).get_file()
@@ -3195,6 +3260,8 @@ class SessionMicro:
 
     # --- logique ---
     async def trame(self, x, rms: float) -> None:
+        if _jeu["actif"]:
+            return  # pendant un jeu, on n'écoute pas le micro de la page (moins de processeur)
         now = time.time()
         if self.mode in ("veille", "suivi"):
             self.fond = rms if rms < self.fond else self.fond * 0.995 + rms * 0.005
@@ -3573,5 +3640,7 @@ if __name__ == "__main__":
         accelerer()
     elif len(sys.argv) > 1 and sys.argv[1] == "google":
         connecter_google()
+    elif len(sys.argv) > 1 and sys.argv[1] in ("memoire", "mémoire", "memoire-wsl"):
+        memoire_wsl()
     else:
         main()
