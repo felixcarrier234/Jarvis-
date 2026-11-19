@@ -358,6 +358,10 @@ def reglages() -> None:
         for k in ("adresse", "dom_lat", "dom_lon"):
             s.pop(k, None)
     s["prenom"] = ask("12) COURRIELS — ton prénom pour signer les réponses (vide = sans signature)", s.get("prenom", ""))
+    s["mode_jeu_auto"] = ask("13) MODE JEU automatique quand tu lances un jeu (libère la carte graphique) ? (o/n)",
+                             "o" if s.get("mode_jeu_auto", True) else "n").lower().startswith("o")
+    s["garder_ia_minutes"] = int(ask("14) Garder l'IA dans la carte graphique combien de minutes après une question ?",
+                                     str(s.get("garder_ia_minutes", 10))) or 10)
 
     save_settings(s)
     print(f"\nRéglages enregistrés dans {SETTINGS}\n\nTest des connexions…")
@@ -1791,9 +1795,87 @@ def clean(text: str) -> str:
 _model_cache: dict = {}
 
 
+# --- Mode jeu : libérer la carte graphique pendant que tu joues ---------------
+
+_jeu = {"actif": False, "manuel": False, "nom": ""}
+MOTS_JEU_ON = re.compile(r"^\s*(?:jarvis\W+)?(?:(?:active|mets|passe en|lance)\s+(?:le\s+)?)?mode\s+(?:jeu|gaming|gamer)"
+                         r"|\bje (?:vais|m.en vais) (?:jouer|gamer|faire une game)\b", re.I)
+MOTS_JEU_OFF = re.compile(r"\b(?:fin du|arrête le|arrete le|désactive le|desactive le|quitte le|sors du)\s+mode\s+(?:jeu|gaming)"
+                          r"|\bj.ai fini de (?:jouer|gamer)\b|\bmode\s+(?:jeu|gaming)\s+(?:off|désactivé|desactive)\b", re.I)
+JEUX_DOSSIERS = r"steamapps\\common|Epic Games|Riot Games|XboxGames|ModifiableWindowsApps|Battle\.net|Blizzard|EA Games|Electronic Arts|Ubisoft Game Launcher\\games|GOG Galaxy\\Games|Rockstar Games|\\Games\\"
+JEUX_EXE = (r"^(FortniteClient.*|VALORANT-Win64.*|League of Legends|RocketLeague|cs2|GTA5|GTA6|Minecraft\.Windows|javaw|r5apex"
+            r"|cod|Overwatch|eldenring|Cyberpunk2077|RDR2|FC2\d|NBA2K\d+|RobloxPlayerBeta|Fallout4|Starfield|Palworld.*"
+            r"|Helldivers2|Marvel.*Rivals.*|Destiny2|dota2|TslGame|Warframe.*|Rust|DeadByDaylight.*|bg3.*)$")
+LANCEURS = (r"Launcher|EpicWebHelper|RiotClient|Battle\.net|Agent|steamwebhelper|Steam$|EADesktop|EABackground|UbisoftConnect"
+            r"|upc|GalaxyClient|SocialClub|CrashReport|UnrealCEFSubProcess|Overlay|Helper|Updater|Setup|Installer")
+
+
+def garder_ia() -> str:
+    return "0" if _jeu["actif"] else f"{int(load_settings().get('garder_ia_minutes', 10))}m"
+
+
+def options_ia() -> dict:
+    o = {"num_ctx": 4096 if _jeu["actif"] else 8192, "temperature": 0.6}
+    if _jeu["actif"]:
+        o["num_gpu"] = 0  # tout sur le processeur : la carte graphique reste au jeu
+    return o
+
+
+def jeu_en_cours() -> str:
+    """Nom du jeu lancé sur Windows (dossiers Steam/Epic/Riot/Xbox… ou exécutables connus), sinon ""."""
+    r = powershell(
+        "Get-Process | Where-Object { ($_.Path -and $_.Path -match '" + JEUX_DOSSIERS + "') -or ($_.ProcessName -match '"
+        + JEUX_EXE + "') } | Where-Object { $_.MainWindowHandle -ne 0 -and $_.ProcessName -notmatch '" + LANCEURS
+        + "' } | Select-Object -First 1 -ExpandProperty ProcessName")
+    return (r.stdout or "").strip().splitlines()[0] if (r.stdout or "").strip() else ""
+
+
+async def liberer_carte_graphique() -> None:
+    """Décharge l'IA et la reconnaissance vocale de la carte graphique tout de suite."""
+    global _whisper
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            charges = (await client.get(f"{OLLAMA}/api/ps")).json().get("models", [])
+            for m in charges:
+                await client.post(f"{OLLAMA}/api/generate", json={"model": m["name"], "keep_alive": 0})
+    except Exception as exc:  # noqa: BLE001
+        print(f"Mode jeu : déchargement de l'IA impossible ({exc})", flush=True)
+    if _whisper_info.get("appareil", "").startswith("carte"):
+        _whisper = None  # sera rechargée sur le processeur
+    _model_cache.pop("name", None)
+
+
+async def mode_jeu(actif: bool, manuel: bool = False, nom: str = "") -> str:
+    if actif == _jeu["actif"]:
+        return "Le mode jeu est déjà activé." if actif else "Le mode jeu est déjà désactivé."
+    nom = re.sub(r"(?:-Win64)?(?:-Shipping)?$", "", nom)
+    nom = re.sub(r"(?<=[a-z])Client$", "", nom).replace("_", " ")
+    _jeu.update(actif=actif, manuel=manuel and actif, nom=nom)
+    _model_cache.pop("name", None)
+    if actif:
+        stop_pc_voice()
+        await liberer_carte_graphique()
+        await diffuser({"t": "jeu", "v": True, "nom": nom})
+        return (f"Mode jeu activé{' pour ' + nom if nom else ''} : j'ai libéré la carte graphique. Je réponds toujours, "
+                "un peu plus lentement, et je reste discret sur les haut-parleurs.")
+    global _whisper
+    if load_settings().get("whisper_gpu"):
+        _whisper = None  # rechargée sur la carte graphique
+    await diffuser({"t": "jeu", "v": False})
+    return "Mode jeu terminé : je reprends la carte graphique pour répondre vite."
+
+
 async def pick_model(client: httpx.AsyncClient) -> str:
-    """Le modèle de la config s'il est installé, sinon le premier disponible."""
+    """Le modèle de la config s'il est installé, sinon le premier disponible (le plus petit en mode jeu)."""
     if "name" in _model_cache:
+        return _model_cache["name"]
+    if _jeu["actif"]:
+        r = await client.get(f"{OLLAMA}/api/tags")
+        r.raise_for_status()
+        modeles = sorted(r.json().get("models", []), key=lambda m: m.get("size", 0))
+        voulu = load_settings().get("modele_jeu", "qwen3.5:2b")
+        noms = [m.get("name", "") for m in modeles]
+        _model_cache["name"] = voulu if voulu in noms else (noms[0] if noms else MODEL)
         return _model_cache["name"]
     r = await client.get(f"{OLLAMA}/api/tags")
     r.raise_for_status()
@@ -1815,8 +1897,8 @@ async def llm(messages: list[dict]) -> str:
             "messages": messages,
             "stream": False,
             "think": False,
-            "options": {"num_ctx": 8192, "temperature": 0.6},
-            "keep_alive": "60m",  # garde l'IA chargée dans la carte graphique : réponses plus rapides
+            "options": options_ia(),
+            "keep_alive": garder_ia(),  # l'IA reste chargée quelques minutes (0 en mode jeu)
         }
         r = await client.post(f"{OLLAMA}/api/chat", json=body)
         if r.status_code == 400 and "think" in r.text:
@@ -1891,7 +1973,7 @@ async def llm_stream(messages: list[dict]):
     """Réponse de l'IA morceau par morceau (pour commencer à parler plus tôt)."""
     async with httpx.AsyncClient(timeout=600) as client:
         body = {"model": await pick_model(client), "messages": messages, "stream": True, "think": False,
-                "options": {"num_ctx": 8192, "temperature": 0.6}, "keep_alive": "60m"}
+                "options": options_ia(), "keep_alive": garder_ia()}
         for essai in range(2):
             async with client.stream("POST", f"{OLLAMA}/api/chat", json=body) as r:
                 if r.status_code == 400 and essai == 0:
@@ -1984,7 +2066,7 @@ def whisper():
     if _whisper is None:
         from faster_whisper import WhisperModel
 
-        if load_settings().get("whisper_gpu") and _precharger_cuda():
+        if load_settings().get("whisper_gpu") and not _jeu["actif"] and _precharger_cuda():
             try:
                 print(f"Chargement de la reconnaissance vocale ({WHISPER_MODEL}) sur la carte graphique…", flush=True)
                 _whisper = WhisperModel(WHISPER_MODEL, device="cuda", compute_type="float16")
@@ -2227,7 +2309,7 @@ async def say(bot, chat_id: int | str, text: str, reply_to=None) -> None:
         await reply_to.reply_text(text)
     else:
         await bot.send_message(chat_id, text)
-    if load_settings().get("pc_voice"):
+    if load_settings().get("pc_voice") and not _jeu["actif"]:
         try:
             await speak_on_pc(text)
         except Exception as exc:  # noqa: BLE001
@@ -2316,6 +2398,10 @@ async def intention(question: str) -> str | None:
     if MOTS_STOP.match(question):
         stop_pc_voice()
         return "D'accord."
+    if MOTS_JEU_OFF.search(question):
+        return await mode_jeu(False)
+    if MOTS_JEU_ON.search(question):
+        return await mode_jeu(True, manuel=True)
     if _agenda_attente and (OUI.match(question) or NON.match(question)):
         if (r := await gerer_agenda(question)) is not None:
             return r
@@ -2562,6 +2648,14 @@ async def cmd_canadiens(update, context) -> None:
     await _repondre_cmd(update, context, "🏒 " + (texte or "Pas de match trouvé."))
 
 
+async def cmd_jeu(update, context) -> None:
+    if not _allowed(update):
+        return
+    arg = " ".join(context.args).lower()
+    actif = not _jeu["actif"] if not arg else arg not in ("off", "non", "fin", "stop")
+    await update.effective_message.reply_text("🎮 " + await mode_jeu(actif, manuel=True))
+
+
 async def cmd_aide(update, context) -> None:
     await update.effective_message.reply_text(
         "Je suis Jarvis 🤖\n\n"
@@ -2576,7 +2670,8 @@ async def cmd_aide(update, context) -> None:
         "• /liste, /epicerie, /taches — tes listes\n"
         "• /memoire — ce que je sais sur toi (et /oublie N)\n"
         "• /canadiens — résultats et prochain match\n"
-        "• /stop — me faire taire sur l'ordi\n\n"
+        "• /stop — me faire taire sur l'ordi\n"
+        "• /jeu — mode jeu (libère la carte graphique ; automatique quand un jeu est lancé)\n\n"
         "Je peux aussi : répondre à tes courriels (« Réponds à Amélie que … » ou juste « Réponds à Amélie »), "
         "gérer ton agenda (« Ajoute dentiste mardi à 14 h à mon agenda », « Déplace le dentiste à jeudi », "
         "« Annule mon rendez-vous chez le dentiste »), "
@@ -2825,6 +2920,17 @@ async def watcher(app) -> None:
         except Exception as exc:  # noqa: BLE001
             print(f"Anniversaires : {exc}", flush=True)
 
+        try:  # mode jeu automatique
+            if s.get("mode_jeu_auto", True) and shutil.which("powershell.exe") and time.time() - etat.get("_jeu_t", 0) > 45:
+                etat["_jeu_t"] = time.time()
+                nom = await asyncio.to_thread(jeu_en_cours)
+                if nom and not _jeu["actif"]:
+                    await app.bot.send_message(chat_id, "🎮 " + await mode_jeu(True, nom=nom))
+                elif not nom and _jeu["actif"] and not _jeu["manuel"]:
+                    await app.bot.send_message(chat_id, "🎮 " + await mode_jeu(False))
+        except Exception as exc:  # noqa: BLE001
+            print(f"Mode jeu : {exc}", flush=True)
+
         try:  # résultat du Canadien dès la fin du match
             if s.get("equipe", "MTL") and time.time() - last_nhl_check > 600:
                 last_nhl_check = time.time()
@@ -2984,6 +3090,7 @@ function connecter() {
     else if (m.t === 'moi') bulle(m.texte, 'moi');
     else if (m.t === 'jarvis') bulle(m.texte, 'jarvis', m.suite);
     else if (m.t === 'erreur') bulle(m.texte, 'erreur');
+    else if (m.t === 'jeu') $('sous').textContent = m.v ? '🎮 Mode jeu' + (m.nom ? ' — ' + m.nom : '') : 'Systèmes en ligne';
     else if (m.t === 'reveil') { corps.classList.add('reveil'); setTimeout(() => corps.classList.remove('reveil'), 500); } };
 }
 
@@ -3317,6 +3424,8 @@ def build_web_app():
         HUB.add(ws)
         session = SessionMicro(ws)
         await ws.send_json({"t": "etat", "v": _etat["v"]})
+        if _jeu["actif"]:
+            await ws.send_json({"t": "jeu", "v": True, "nom": _jeu["nom"]})
         try:
             async for msg in ws:
                 if msg.type == web.WSMsgType.BINARY:
@@ -3389,6 +3498,11 @@ def main() -> None:
     async def prechauffer():
         """Charge l'IA dans la carte graphique et la reconnaissance vocale dès le démarrage."""
         try:
+            if shutil.which("powershell.exe") and load_settings().get("mode_jeu_auto", True):
+                nom = await asyncio.to_thread(jeu_en_cours)
+                if nom:
+                    await mode_jeu(True, nom=nom)
+                    return
             await asyncio.to_thread(whisper)
             await llm([{"role": "user", "content": "Réponds seulement : OK."}])
             print("⚡ IA et reconnaissance vocale prêtes.", flush=True)
@@ -3426,6 +3540,7 @@ def main() -> None:
         app.add_handler(CommandHandler(["epicerie", "courses"], cmd_epicerie))
         app.add_handler(CommandHandler(["taches", "todo"], cmd_taches))
         app.add_handler(CommandHandler(["stop", "chut"], cmd_stop))
+        app.add_handler(CommandHandler(["jeu", "gaming"], cmd_jeu))
         app.add_handler(CommandHandler(["canadiens", "ch", "hockey"], cmd_canadiens))
         app.add_handler(CommandHandler("effacer", cmd_effacer))
         app.add_handler(CommandHandler("meteo", cmd_meteo))
